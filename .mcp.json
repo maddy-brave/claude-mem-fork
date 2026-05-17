@@ -1,3 +1,12 @@
 {
-  "mcpServers": {}
+  "mcpServers": {
+    "mcp-search": {
+      "type": "stdio",
+      "command": "sh",
+      "args": [
+        "-c",
+        "_C=\"${CLAUDE_CONFIG_DIR:-$HOME/.claude}\"; _E=\"${CLAUDE_PLUGIN_ROOT:-${PLUGIN_ROOT:-}}\"; _CANDIDATES=(); [ -n \"$_E\" ] && _CANDIDATES+=(\"$_E\"); _CANDIDATES+=(\"$PWD/plugin\" \"$PWD\"); while IFS= read -r _DIR; do _CANDIDATES+=(\"$_DIR\"); done < <(ls -dt \"$HOME/.codex/plugins/cache/claude-mem-local/claude-mem\"/[0-9]*/ \"$HOME/.codex/plugins/cache/thedotmack/claude-mem\"/[0-9]*/ \"$_C/plugins/cache/thedotmack/claude-mem\"/[0-9]*/ 2>/dev/null); _CANDIDATES+=(\"$_C/plugins/marketplaces/thedotmack/plugin\"); _P=\"\"; for _R in \"${_CANDIDATES[@]}\"; do _R=\"${_R%/}\"; [ -d \"$_R/plugin/scripts\" ] && _Q=\"$_R/plugin\" || _Q=\"$_R\"; if [ -f \"$_Q/scripts/mcp-server.cjs\" ]; then _P=\"$_Q\"; break; fi; done; [ -n \"$_P\" ] || { echo \"claude-mem: mcp server not found\" >&2; exit 1; }; exec node \"$_P/scripts/mcp-server.cjs\""
+      ]
+    }
+  }
 }

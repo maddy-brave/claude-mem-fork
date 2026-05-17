@@ -5,8 +5,34 @@ const { existsSync, readFileSync } = require('fs');
 const path = require('path');
 const os = require('os');
 
-const INSTALLED_PATH = path.join(os.homedir(), '.claude', 'plugins', 'marketplaces', 'thedotmack');
-const CACHE_BASE_PATH = path.join(os.homedir(), '.claude', 'plugins', 'cache', 'thedotmack', 'claude-mem');
+// ---------------------------------------------------------------------------
+// Profile resolution — priority: $CLAUDE_CONFIG_DIR > ~/.claude (default)
+// $CLAUDE_BRAVEAGENT_HOME is not referenced anywhere in this repo, so that
+// tier is intentionally skipped per the profile-selection spec.
+// ---------------------------------------------------------------------------
+function resolveProfileDir() {
+  if (process.env.CLAUDE_CONFIG_DIR) {
+    return { dir: process.env.CLAUDE_CONFIG_DIR, source: 'CLAUDE_CONFIG_DIR' };
+  }
+  return { dir: path.join(os.homedir(), '.claude'), source: 'default' };
+}
+
+const { dir: PROFILE_DIR, source: PROFILE_SOURCE } = resolveProfileDir();
+
+if (!existsSync(PROFILE_DIR)) {
+  console.error(
+    `\x1b[31m[sync-marketplace] ERROR: resolved profile dir does not exist: ${PROFILE_DIR}\x1b[0m`
+  );
+  console.error(
+    `\x1b[31mSet CLAUDE_CONFIG_DIR to an existing Claude Code profile directory, or create ${PROFILE_DIR} first.\x1b[0m`
+  );
+  process.exit(2);
+}
+
+console.log(`[sync-marketplace] target profile: ${PROFILE_DIR} (source: ${PROFILE_SOURCE})`);
+
+const INSTALLED_PATH = path.join(PROFILE_DIR, 'plugins', 'marketplaces', 'thedotmack');
+const CACHE_BASE_PATH = path.join(PROFILE_DIR, 'plugins', 'cache', 'thedotmack', 'claude-mem');
 
 // Reject obviously invalid ports before they reach http.request, which would
 // throw with a confusing error like "RangeError: Port should be > 0 and < 65536".
@@ -137,8 +163,9 @@ try {
   const rootDir = path.join(__dirname, '..');
   const gitignoreExcludes = getGitignoreExcludes(rootDir);
 
+  const rsyncDest = INSTALLED_PATH.replace(/\\/g, '/');
   execSync(
-    `rsync -av --delete --exclude=.git --exclude=bun.lock --exclude=package-lock.json --exclude=scripts/package.json --exclude=scripts/node_modules ${gitignoreExcludes} ./ ~/.claude/plugins/marketplaces/thedotmack/`,
+    `rsync -av --delete --exclude=.git --exclude=bun.lock --exclude=package-lock.json --exclude=scripts/package.json --exclude=scripts/node_modules ${gitignoreExcludes} ./ "${rsyncDest}/"`,
     { stdio: 'inherit' }
   );
 

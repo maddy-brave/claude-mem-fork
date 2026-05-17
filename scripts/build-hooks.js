@@ -410,6 +410,7 @@ async function buildHooks() {
       'plugin/hooks/hooks.json',
       'plugin/hooks/codex-hooks.json',
       'plugin/scripts/bun-runner.js',
+      'plugin/scripts/mcp-launcher.cjs',
       'plugin/.claude-plugin/plugin.json',
       'plugin/.codex-plugin/plugin.json',
       'plugin/.mcp.json',
@@ -435,15 +436,33 @@ async function buildHooks() {
     }
     const rootMcp = JSON.parse(fs.readFileSync('.mcp.json', 'utf-8'));
     const bundledMcp = JSON.parse(fs.readFileSync('plugin/.mcp.json', 'utf-8'));
-    if (JSON.stringify(rootMcp.mcpServers?.['mcp-search']) !== JSON.stringify(bundledMcp.mcpServers?.['mcp-search'])) {
-      throw new Error('.mcp.json and plugin/.mcp.json mcp-search launchers must stay in sync');
+    const rootEntry = rootMcp.mcpServers?.['mcp-search'];
+    const bundledEntry = bundledMcp.mcpServers?.['mcp-search'];
+    for (const [label, entry] of [['plugin/.mcp.json', bundledEntry], ['.mcp.json', rootEntry]]) {
+      if (entry?.command !== 'node') {
+        throw new Error(`${label} mcp-search must use command "node" to avoid Windows cmd.exe wrapping of bare "sh" tokens (Git Bash is not on cmd.exe PATH for plugin MCP launches). See commit history for the cross-platform launcher rewrite.`);
+      }
+      const argLine = entry?.args?.join(' ') ?? '';
+      if (!argLine.includes('mcp-launcher.cjs')) {
+        throw new Error(`${label} mcp-search args must reference plugin/scripts/mcp-launcher.cjs`);
+      }
+      const forbiddenChars = /[()|+]|=>/;
+      if (forbiddenChars.test(argLine)) {
+        throw new Error(`${label} mcp-search args must not contain cmd.exe-special characters (parens, pipes, plus, =>) — Windows cmd.exe wrapping cannot reliably escape these. Use a plain path or env-var-substituted path instead.`);
+      }
     }
-    const mcpSearchCommand = bundledMcp.mcpServers?.['mcp-search']?.args?.join(' ') ?? '';
-    if (!mcpSearchCommand.includes('.codex/plugins/cache/claude-mem-local/claude-mem')) {
-      throw new Error('plugin/.mcp.json mcp-search launcher must include Codex cache fallback for hosts that do not inject PLUGIN_ROOT');
+    if (!bundledEntry.args.some((a) => a.includes('${CLAUDE_PLUGIN_ROOT}'))) {
+      throw new Error('plugin/.mcp.json must reference ${CLAUDE_PLUGIN_ROOT} so Claude Code resolves the launcher path inside the plugin cache dir');
     }
-    if (!mcpSearchCommand.includes('plugins/cache/thedotmack/claude-mem')) {
-      throw new Error('plugin/.mcp.json mcp-search launcher must include Claude cache fallback for hosts that do not inject PLUGIN_ROOT');
+    const launcherSource = fs.readFileSync('plugin/scripts/mcp-launcher.cjs', 'utf-8');
+    if (!launcherSource.includes('.codex/plugins/cache/claude-mem-local/claude-mem')) {
+      throw new Error('plugin/scripts/mcp-launcher.cjs must include Codex cache fallback for hosts that do not inject PLUGIN_ROOT');
+    }
+    if (!launcherSource.includes('plugins/cache/thedotmack/claude-mem')) {
+      throw new Error('plugin/scripts/mcp-launcher.cjs must include Claude cache fallback for hosts that do not inject PLUGIN_ROOT');
+    }
+    if (!launcherSource.includes('plugins/marketplaces/thedotmack/plugin')) {
+      throw new Error('plugin/scripts/mcp-launcher.cjs must include Claude marketplace fallback');
     }
     console.log('✓ All required distribution files present');
 

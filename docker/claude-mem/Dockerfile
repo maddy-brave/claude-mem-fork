@@ -41,14 +41,27 @@ USER root
 COPY plugin/ /opt/claude-mem/
 RUN chown -R node:node /opt/claude-mem
 
-RUN mkdir -p /home/node/.claude /home/node/.claude-mem \
- && chown -R node:node /home/node/.claude /home/node/.claude-mem
-
 USER node
-WORKDIR /home/node
+RUN cd /opt/claude-mem \
+ && npm install --omit=dev --legacy-peer-deps
+
+USER root
+RUN mkdir -p /home/node/.claude /home/node/.claude-mem /data/claude-mem \
+ && chown -R node:node /home/node/.claude /home/node/.claude-mem /data/claude-mem
 
 COPY --chown=node:node docker/claude-mem/entrypoint.sh /usr/local/bin/claude-mem-entrypoint
 RUN chmod +x /usr/local/bin/claude-mem-entrypoint
 
+USER node
+WORKDIR /home/node
+
+# Phase 10 — server-beta runtime is the only foregrounded process. The legacy
+# worker binaries remain available for tooling but are NEVER spawned by the
+# entrypoint. Mode selection happens via CLAUDE_MEM_CONTAINER_MODE
+# (server | worker | shell). `docker run ... bash` works because shell mode
+# falls through to "$@".
+ENV CLAUDE_MEM_CONTAINER_MODE=server
+ENV CLAUDE_MEM_RUNTIME=server-beta
+
 ENTRYPOINT ["/usr/local/bin/claude-mem-entrypoint"]
-CMD ["bash"]
+CMD []

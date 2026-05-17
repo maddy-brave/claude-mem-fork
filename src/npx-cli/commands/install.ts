@@ -619,6 +619,7 @@ function mergeSettings(updates: Record<string, string>): boolean {
 type ProviderId = 'claude' | 'gemini' | 'openrouter';
 type ClaudeAccessMode = 'subscription' | 'api-key';
 type ClaudeApiMode = 'direct' | 'gateway';
+type RuntimeId = 'worker' | 'server-beta';
 
 function readRawStoredAuthMethod(): 'subscription' | 'api-key' | 'gateway' | undefined {
   try {
@@ -640,6 +641,68 @@ function resolveClaudeAuthMethod(): 'subscription' | 'api-key' | 'gateway' {
   if (env.ANTHROPIC_BASE_URL?.trim()) return 'gateway';
   if (env.ANTHROPIC_API_KEY?.trim()) return 'api-key';
   return 'subscription';
+}
+
+async function promptRuntime(): Promise<RuntimeId> {
+  if (!isInteractive) {
+    mergeSettings({ CLAUDE_MEM_RUNTIME: 'worker' });
+    return 'worker';
+  }
+
+  const selected = await p.select<RuntimeId>({
+    message: 'Which runtime should claude-mem start after install?',
+    options: [
+      { value: 'worker', label: 'Worker', hint: 'stable compatibility path' },
+      { value: 'server-beta', label: 'Server (beta)', hint: 'REST V1, API keys, team-ready storage' },
+    ],
+    initialValue: 'worker',
+  });
+
+  if (p.isCancel(selected)) {
+    p.cancel('Installation cancelled.');
+    process.exit(0);
+  }
+
+  mergeSettings({
+    CLAUDE_MEM_RUNTIME: selected,
+  });
+
+  if (selected === 'server-beta') {
+    await maybeBootstrapServerBetaApiKey();
+  }
+  return selected;
+}
+
+async function maybeBootstrapServerBetaApiKey(): Promise<void> {
+  // Only attempt if Postgres is configured. Without DATABASE_URL we cannot
+  // reach the api_keys table — the operator must configure the server first
+  // and rerun `claude-mem server keys rotate`.
+  if (!process.env.CLAUDE_MEM_SERVER_DATABASE_URL) {
+    log.warn(
+      'Skipping local hook API key bootstrap: CLAUDE_MEM_SERVER_DATABASE_URL is not set. '
+        + 'Run `npx claude-mem server keys rotate` after configuring Postgres to provision a key.',
+    );
+    return;
+  }
+  try {
+    const { bootstrapServerBetaApiKey, persistServerBetaSettings } = await import(
+      '../../services/hooks/server-beta-bootstrap.js'
+    );
+    const result = await bootstrapServerBetaApiKey();
+    persistServerBetaSettings(USER_SETTINGS_PATH, {
+      apiKey: result.rawKey,
+      projectId: result.projectId,
+    });
+    log.info(
+      `Provisioned local hook API key (project=${result.projectId.slice(0, 8)}…). `
+        + 'Settings saved with mode 0600.',
+    );
+  } catch (error: unknown) {
+    log.warn(
+      `Failed to bootstrap server-beta API key: ${error instanceof Error ? error.message : String(error)}. `
+        + 'Hooks will fall back to the worker until you run `npx claude-mem server keys rotate`.',
+    );
+  }
 }
 
 async function promptProvider(options: InstallOptions): Promise<ProviderId> {
@@ -1025,6 +1088,7 @@ export async function runInstallCommand(options: InstallOptions = {}): Promise<v
     selectedIDEs = ['claude-code'];
   }
 
+  const selectedRuntime = await promptRuntime();
   const selectedProvider = await promptProvider(options);
   if (selectedProvider === 'claude') {
     await promptClaudeModel(options);
@@ -1169,7 +1233,7 @@ export async function runInstallCommand(options: InstallOptions = {}): Promise<v
 
   await runTasks([
     {
-      title: 'Starting worker daemon',
+      title: selectedRuntime === 'server-beta' ? 'Starting server beta daemon' : 'Starting worker daemon',
       task: async (message) => {
         if (autoStartSkipped) {
           return isInteractive
@@ -1180,15 +1244,15 @@ export async function runInstallCommand(options: InstallOptions = {}): Promise<v
         const marketplaceScriptPath = join(marketplaceDirectory(), 'plugin', 'scripts', 'worker-service.cjs');
         const cacheScriptPath = join(pluginCacheDirectory(version), 'scripts', 'worker-service.cjs');
         const scriptPath = existsSync(marketplaceScriptPath) ? marketplaceScriptPath : cacheScriptPath;
-        message(`Spawning worker on port ${port}...`);
+        message(`Spawning ${selectedRuntime === 'server-beta' ? 'server beta' : 'worker'} on port ${port}...`);
         workerStartResult = await ensureWorkerStarted(port, scriptPath);
         switch (workerStartResult) {
           case 'ready':
-            return `Worker ready at http://localhost:${port} ${pc.green('OK')}`;
+            return `${selectedRuntime === 'server-beta' ? 'Server beta' : 'Worker'} ready at http://localhost:${port} ${pc.green('OK')}`;
           case 'warming':
-            return `Worker starting on port ${port} — finishing in background ${pc.yellow('⏳')}`;
+            return `${selectedRuntime === 'server-beta' ? 'Server beta' : 'Worker'} starting on port ${port} — finishing in background ${pc.yellow('⏳')}`;
           case 'dead':
-            return `Worker did not start — try \`npx claude-mem start\` manually ${pc.yellow('!')}`;
+            return `${selectedRuntime === 'server-beta' ? 'Server beta' : 'Worker'} did not start — try \`${selectedRuntime === 'server-beta' ? 'npx claude-mem server start' : 'npx claude-mem start'}\` manually ${pc.yellow('!')}`;
         }
       },
     },
@@ -1256,11 +1320,13 @@ export async function runInstallCommand(options: InstallOptions = {}): Promise<v
 
   const finalWorkerState = workerStartResult as WorkerStartResult;
   const workerAlive = finalWorkerState !== 'dead' || workerReady;
+  const runtimeLabel = selectedRuntime === 'server-beta' ? 'Server beta' : 'Worker';
+  const runtimeStartCommand = selectedRuntime === 'server-beta' ? 'npx claude-mem server start' : 'npx claude-mem start';
   const workerHeadline = autoStartSkipped
-    ? `${pc.yellow('!')} Worker autostart skipped — start it manually with ${pc.bold('npx claude-mem start')}`
+    ? `${pc.yellow('!')} ${runtimeLabel} autostart skipped — start it manually with ${pc.bold(runtimeStartCommand)}`
     : workerReady || finalWorkerState === 'ready'
-      ? `${pc.green('✓')} Worker running at ${pc.underline(`http://localhost:${actualPort}`)}`
-      : `${pc.yellow('⏳')} Worker starting at ${pc.underline(`http://localhost:${actualPort}`)} — give it ~30s, then refresh`;
+      ? `${pc.green('✓')} ${runtimeLabel} running at ${pc.underline(`http://localhost:${actualPort}`)}`
+      : `${pc.yellow('⏳')} ${runtimeLabel} starting at ${pc.underline(`http://localhost:${actualPort}`)} — give it ~30s, then refresh`;
   const nextSteps = autoStartSkipped
     ? [
         workerHeadline,

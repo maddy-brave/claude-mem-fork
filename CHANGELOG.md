@@ -4,6 +4,110 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [13.1.0] - 2026-05-11
+
+## Server-beta event pipeline (phases 4–13)
+
+This release lands the full server-beta track developed on `server-beta-phase-4-event-pipeline` — a self-contained Postgres + BullMQ event-to-observation pipeline with API-key auth, team/project scope, audit log, three AI providers (Anthropic, OpenAI, Google), a dedicated MCP server, legacy compat adapters for existing worker clients, a Docker/Compose stack, and a generation-job retry/cancel surface.
+
+### Highlights
+
+- **Event pipeline**: `agent_event` → `observation_generation_jobs` (outbox) → BullMQ worker → `observation` row. Idempotent enqueue, request-id propagation end-to-end, structured audit log.
+- **API surface**: `POST /v1/events`, `POST /v1/sessions/start`, `POST /v1/sessions/:id/end`, generation-job list/retry/cancel, MCP routes, scoped reads.
+- **Legacy compat**: `/api/sessions/observations` and `/api/sessions/summarize` shims map legacy worker payloads into the new event/job model without touching worker code. Both shims now wrap session lookup in their try/catch so Postgres failures return structured JSON, and `resolveServerSession` survives TOCTOU races via 23505 catch-and-refetch.
+- **POST /v1/sessions/start** also catches 23505 on concurrent start with the same `externalSessionId` and refetches the winning row instead of returning 500.
+- **Generation providers**: Anthropic, OpenAI, and Google with per-team-project scope enforcement and error classification.
+- **Docker / Compose stack** and `bin/server-beta-cli` for local operator workflows.
+
+### Bug fixes
+
+- `resolveServerSession` Postgres errors no longer escape `asyncHandler.catch(next)` and return HTML 500s to legacy clients.
+- `POST /v1/sessions/start` no longer returns 500 to the loser of a concurrent same-`externalSessionId` race.
+
+Full PR thread: #2383.
+
+## [13.0.1] - 2026-05-10
+
+## Bug fixes
+
+### MCP server
+- **#2371** — drop `${_R%/}` parameter-expansion trim in `.mcp.json` that tripped Claude Code's MCP validator
+
+### Environment isolation
+- **#2357** — block `ANTHROPIC_BASE_URL` leak; use a three-branch OAuth-skip predicate
+- Add `CLAUDE_MEM_ENV_FILE` lazy resolver so tests (and multi-profile users) can redirect the env-file path without module-load-order constraints
+
+### Worker lifecycle
+- Classify Claude SDK HTTP 400 as **unrecoverable** so the worker stops retrying a doomed request
+- Stop hook crash hardened: `onclose` handler now performs background tree-kill on unexpected subprocess exit
+
+### Chroma
+- **#2313** — enforce a single `chroma-mcp` subprocess per worker (singleton via `disposeCurrentSubprocess()` on every code path; tree-kill of orphans on dispose)
+- Pin `onnxruntime>=1.20` and `protobuf<7` to fix `INVALID_PROTOBUF` on macOS arm64
+
+### Build
+- Polyfill `import.meta.url` to `pathToFileURL(__filename)` in the CJS worker bundle so ESM-style code resolves correctly (CodeRabbit-driven follow-up)
+
+### Tests / review
+- `tests/env-isolation.test.ts` no longer mutates the real `~/.claude-mem/.env`; OAuth spy wrapped in try/finally to avoid leaks across runs
+- 3 new chroma-mcp regression tests for #2313 (singleton enforcement)
+
+### Misc
+- Daily dependency bump per CLAUDE.md maintenance policy
+
+Full diff: https://github.com/thedotmack/claude-mem/pull/2394
+
+## [13.0.0] - 2026-05-08
+
+## Highlights
+
+This is the **claude-mem 13** major release, landing the Server Beta runtime and the project's relicense.
+
+### Server Beta runtime (opt-in)
+- Independent server-beta service with its own lifecycle (`claude-mem server start/status/stop`)
+- Postgres-backed observation storage
+- BullMQ + Redis observation queue engine (gated behind `CLAUDE_MEM_QUEUE_ENGINE=bullmq`, fail-fast)
+- New `/v1` REST API surface (events, sessions, memories, search, context, audit, jobs)
+- API-key auth + Better-Auth proxy
+- Outbox pattern for transactional event-to-job pipelines
+- Generation-job primitives (`ServerJobQueue`, `ActiveServerBetaQueueManager`, deterministic colon-free SHA-256 job IDs)
+- Docker Compose + E2E harness for the new stack
+
+### Licensing
+- Repository relicensed from **AGPL-3.0** to **Apache-2.0**
+- `NOTICE` file added
+- `docs/license.md` and `docs/ip-boundary.md` clarify the OSS / commercial boundary
+- `ragtime/` subproject also relicensed to Apache-2.0
+
+### Installer
+- Server Beta is exposed as an installer option (default off — open-source core is unaffected)
+
+## Migration notes
+- Existing users on the worker-era plugin keep working — no breaking changes for the default install
+- Server Beta is opt-in. Worker continues to run on its existing port and SQLite store.
+- See `docs/migration-worker-to-server.md` for forward-looking migration guidance
+
+## Compatibility
+- Node ≥ 20, Bun ≥ 1.0
+- Server Beta requires Postgres + Redis (only when enabled)
+
+Full diff: https://github.com/thedotmack/claude-mem/compare/v12.7.5...v13.0.0
+
+## [12.7.5] - 2026-05-07
+
+Patch release for npx installs that hit an existing Codex marketplace registration.
+
+Fixes:
+- If Codex already has claude-mem-local registered from a different source, the installer now removes that stale registration and re-adds the local npx marketplace instead of failing.
+- Keeps Codex plugin_hooks enablement and legacy AGENTS cleanup after the marketplace registration succeeds.
+- Updates the release workflow instructions to use npm run build-and-sync instead of plain npm run build so the local marketplace and worker are synced during releases.
+
+Validation:
+- npm run build-and-sync
+- bun test tests/install-non-tty.test.ts tests/infrastructure/plugin-distribution.test.ts tests/servers/mcp-tool-schemas.test.ts tests/setup-runtime.test.ts tests/hook-command.test.ts
+- Docker smoke with codex-cli 0.128.0 reproducing the remote-to-local marketplace source conflict and verifying install completion.
+- npx --yes claude-mem@12.7.5 --version
+
 ## [12.7.4] - 2026-05-07
 
 Patch release for the Codex mem-search marketplace fix.

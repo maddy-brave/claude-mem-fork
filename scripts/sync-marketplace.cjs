@@ -143,10 +143,7 @@ try {
   );
 
   console.log('Running bun install in marketplace...');
-  execSync(
-    'cd ~/.claude/plugins/marketplaces/thedotmack/ && bun install',
-    { stdio: 'inherit' }
-  );
+  execSync(`bun install`, { cwd: INSTALLED_PATH, stdio: 'inherit' });
 
   const version = getPluginVersion();
   const CACHE_VERSION_PATH = path.join(CACHE_BASE_PATH, version);

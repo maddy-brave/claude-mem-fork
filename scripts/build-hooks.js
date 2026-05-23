@@ -415,7 +415,6 @@ async function buildHooks() {
       'plugin/.codex-plugin/plugin.json',
       'plugin/.mcp.json',
       '.codex-plugin/plugin.json',
-      '.mcp.json',
       '.agents/plugins/marketplace.json',
     ];
     for (const filePath of requiredDistributionFiles) {
@@ -434,22 +433,18 @@ async function buildHooks() {
     if (claudeMemMarketplaceEntry?.source?.path !== './plugin') {
       throw new Error('.agents/plugins/marketplace.json must point claude-mem source.path at ./plugin so Codex loads the bundled plugin root');
     }
-    const rootMcp = JSON.parse(fs.readFileSync('.mcp.json', 'utf-8'));
     const bundledMcp = JSON.parse(fs.readFileSync('plugin/.mcp.json', 'utf-8'));
-    const rootEntry = rootMcp.mcpServers?.['mcp-search'];
     const bundledEntry = bundledMcp.mcpServers?.['mcp-search'];
-    for (const [label, entry] of [['plugin/.mcp.json', bundledEntry], ['.mcp.json', rootEntry]]) {
-      if (entry?.command !== 'node') {
-        throw new Error(`${label} mcp-search must use command "node" to avoid Windows cmd.exe wrapping of bare "sh" tokens (Git Bash is not on cmd.exe PATH for plugin MCP launches). See commit history for the cross-platform launcher rewrite.`);
-      }
-      const argLine = entry?.args?.join(' ') ?? '';
-      if (!argLine.includes('mcp-launcher.cjs')) {
-        throw new Error(`${label} mcp-search args must reference plugin/scripts/mcp-launcher.cjs`);
-      }
-      const forbiddenChars = /[()|+]|=>/;
-      if (forbiddenChars.test(argLine)) {
-        throw new Error(`${label} mcp-search args must not contain cmd.exe-special characters (parens, pipes, plus, =>) — Windows cmd.exe wrapping cannot reliably escape these. Use a plain path or env-var-substituted path instead.`);
-      }
+    if (bundledEntry?.command !== 'node') {
+      throw new Error('plugin/.mcp.json mcp-search must use command "node" to avoid Windows cmd.exe wrapping of bare "sh" tokens (Git Bash is not on cmd.exe PATH for plugin MCP launches). See commit history for the cross-platform launcher rewrite.');
+    }
+    const argLine = bundledEntry?.args?.join(' ') ?? '';
+    if (!argLine.includes('mcp-launcher.cjs')) {
+      throw new Error('plugin/.mcp.json mcp-search args must reference plugin/scripts/mcp-launcher.cjs');
+    }
+    const forbiddenChars = /[()|+]|=>/;
+    if (forbiddenChars.test(argLine)) {
+      throw new Error('plugin/.mcp.json mcp-search args must not contain cmd.exe-special characters (parens, pipes, plus, =>). Windows cmd.exe wrapping cannot reliably escape these. Use a plain path or env-var-substituted path instead.');
     }
     if (!bundledEntry.args.some((a) => a.includes('${CLAUDE_PLUGIN_ROOT}'))) {
       throw new Error('plugin/.mcp.json must reference ${CLAUDE_PLUGIN_ROOT} so Claude Code resolves the launcher path inside the plugin cache dir');

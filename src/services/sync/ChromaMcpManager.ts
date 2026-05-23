@@ -105,9 +105,12 @@ export class ChromaMcpManager {
     const spawnEnvironment = this.getSpawnEnv();
     getSupervisor().assertCanSpawn('chroma mcp');
 
-    const isWindows = process.platform === 'win32';
-    const uvxSpawnCommand = isWindows ? (process.env.ComSpec || 'cmd.exe') : 'uvx';
-    const uvxSpawnArgs = isWindows ? ['/c', 'uvx', ...commandArgs] : commandArgs;
+    // Direct uvx spawn on all platforms. The previous Windows branch
+    // wrapped uvx in `cmd.exe /c`, but cmd.exe's stdin relay drops JSON-RPC
+    // bytes before chroma-mcp can read them, so MCP initialize never
+    // completes and every sync attempt fails with -32000 Connection closed.
+    const uvxSpawnCommand = 'uvx';
+    const uvxSpawnArgs = commandArgs;
 
     logger.info('CHROMA_MCP', 'Connecting to chroma-mcp via MCP stdio', {
       command: uvxSpawnCommand,

@@ -4,6 +4,43 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [13.3.0] - 2026-05-21
+
+## What's New
+
+### New skills
+
+- **design-is** (#2483) — audits a design against Dieter Rams' ten "Good design is..." principles. Produces per-principle 0–3 scores with file:line evidence and a NEW / REFINE / REDESIGN verdict, then hands off a ready-to-run `/make-plan` prompt.
+- **weekly-digests** (#2399) — produces a chapter-per-ISO-week serial digest of a project's full claude-mem timeline. Sequential subagent pipeline keeps the narrative coherent across 30+ chapters.
+- **oh-my-issues** (#2409) — root-cause issue clustering. Codifies the consolidation method that turned ~100 open issues into 6 plan-masters during the v13.0.1 cycle. Three modes: cluster pass, triage, bundle.
+
+### Fixes
+
+- **fix(mcp): drop duplicate root `.mcp.json`** (#2411) — Claude Code's `/doctor` was warning "MCP server mcp-search skipped — same command/URL as already-configured mcp-search" for every plugin user. The root copy was vestigial; the plugin's namespaced registration now wins.
+- **fix: stop Codex transcript replay after hooks migration** (#2365) — disables the default `~/.codex/sessions/**/*.jsonl` watch (native Codex hooks are now authoritative). Repairs `~/.codex/config.toml` to set `[features] hooks = true` and `[plugins."claude-mem@claude-mem-local"] enabled = true` directly. Fixes transcript replay where files discovered after startup ignored `startAtEnd` and re-injected history.
+
+Opt back into legacy Codex transcript ingestion with `CLAUDE_MEM_CODEX_TRANSCRIPT_INGESTION=true` if you depend on the JSONL watcher.
+
+## [13.2.0] - 2026-05-12
+
+## What's new
+
+### `wowerpoint` skill — kawaii NotebookLM slide-deck generator
+
+Turn one source document into a kawaii NotebookLM slide-deck PDF. Wraps the `notebooklm` CLI with the kawaii-prompt + `--format detailed` defaults and a spawn-subagent pattern so generation (~10 min) never blocks the main conversation.
+
+- **Single-source-per-deck** is enforced by the workflow shape: confirm or write the source doc *before* adding it to NotebookLM. Don't paper over a weak source by stacking more sources — write a comprehensive doc first.
+- **Slide-deck only.** Videos and podcasts from the same engine are noticeably worse and out of scope; the skill refers users to the `notebooklm` CLI directly for those formats.
+- **Default prompt template:** `Use kawaii characters to tell the story of <subject>. Keep it warm and clear.` Pass any user-supplied prompt through verbatim.
+- **Setup requires** `notebooklm-py` (via `uv tool install --with playwright`), `playwright install chromium`, and `jq`.
+- **Spawn-and-end-turn** pattern: the subagent's completion notification fires when the PDF is on disk; the main conversation never blocks on the ~10 min render.
+
+See PR #2430 for the full design notes and review history.
+
+## Skills inventory
+
+This release brings the plugin to **12 skills**: babysit, do, how-it-works, knowledge-agent, learn-codebase, make-plan, mem-search, pathfinder, smart-explore, timeline-report, version-bump, wowerpoint.
+
 ## [13.1.0] - 2026-05-11
 
 ## Server-beta event pipeline (phases 4–13)

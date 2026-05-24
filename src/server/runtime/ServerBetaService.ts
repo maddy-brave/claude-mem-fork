@@ -19,6 +19,8 @@ import { SessionsObservationsAdapter } from '../compat/SessionsObservationsAdapt
 import { SessionsSummarizeAdapter } from '../compat/SessionsSummarizeAdapter.js';
 import { ActiveServerBetaQueueManager } from './ActiveServerBetaQueueManager.js';
 import type { ServerBetaServiceGraph, ServerBetaQueueLaneMetric } from './types.js';
+import { sanitizeEnv } from '../../supervisor/env-sanitizer.js';
+import { SettingsDefaultsManager } from '../../shared/SettingsDefaultsManager.js';
 
 const SERVER_BETA_RUNTIME = 'server-beta';
 const DEFAULT_SERVER_BETA_HOST = '127.0.0.1';
@@ -584,10 +586,12 @@ function spawnServerBetaDaemon(port: number): number | undefined {
   const child = spawn(process.execPath, [scriptPath, '--daemon'], {
     detached: true,
     stdio: 'ignore',
-    env: {
+    env: sanitizeEnv({
       ...process.env,
+      CLAUDE_MEM_DATA_DIR: process.env.CLAUDE_MEM_DATA_DIR ?? SettingsDefaultsManager.get('CLAUDE_MEM_DATA_DIR'),
+      CLAUDE_MEM_WORKER_PORT: String(SettingsDefaultsManager.get('CLAUDE_MEM_WORKER_PORT')),
       CLAUDE_MEM_SERVER_PORT: String(port),
-    },
+    }),
   });
   child.unref();
   return child.pid;

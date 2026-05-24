@@ -1,3 +1,4 @@
+import './env-bootstrap.js';
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
 import { join, dirname } from 'path';

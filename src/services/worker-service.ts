@@ -895,7 +895,11 @@ function runServerBetaServiceCli(command: string): void {
 
   const child = spawn(process.execPath, [serverBetaScript, command], {
     stdio: 'inherit',
-    env: process.env,
+    env: sanitizeEnv({
+      ...process.env,
+      CLAUDE_MEM_DATA_DIR: process.env.CLAUDE_MEM_DATA_DIR ?? SettingsDefaultsManager.get('CLAUDE_MEM_DATA_DIR'),
+      CLAUDE_MEM_WORKER_PORT: String(SettingsDefaultsManager.get('CLAUDE_MEM_WORKER_PORT')),
+    }),
   });
   child.on('error', (error) => {
     console.error(`Failed to start server beta command: ${error.message}`);

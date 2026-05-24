@@ -9,6 +9,7 @@ dist/
 *.tmp
 *.temp
 .install-version
+.claude/
 .claude/settings.local.json
 .claude/agents/
 .claude/skills/

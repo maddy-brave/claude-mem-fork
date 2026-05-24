@@ -7,6 +7,7 @@ import { HOOK_TIMEOUTS, HOOK_EXIT_CODES, getTimeout } from "./hook-constants.js"
 import { SettingsDefaultsManager } from "./SettingsDefaultsManager.js";
 import { MARKETPLACE_ROOT, DATA_DIR } from "./paths.js";
 import { loadFromFileOnce } from "./hook-settings.js";
+import { acquireSpawnLock } from "./spawn-lock.js";
 import { validateWorkerPidFile } from "../supervisor/index.js";
 import { isPortInUse } from "../services/infrastructure/HealthMonitor.js";
 import { readPidFile, isProcessAlive } from "../services/infrastructure/ProcessManager.js";
@@ -327,32 +328,39 @@ export async function ensureWorkerRunning(): Promise<boolean> {
 
   logger.info('SYSTEM', 'Worker not running — lazy-spawning', { runtimePath, scriptPath, configuredPort });
 
-  try {
-    const proc = spawnHidden(runtimePath, [scriptPath, '--daemon'], {
-      detached: true,
-      stdio: ['ignore', 'ignore', 'ignore'],
-      env: {
-        ...process.env,
-        CLAUDE_MEM_DATA_DIR: SettingsDefaultsManager.get('CLAUDE_MEM_DATA_DIR'),
-        CLAUDE_MEM_WORKER_PORT: String(configuredPort),
-      },
-    });
-    proc.unref();
-  } catch (error: unknown) {
-    if (error instanceof Error) {
-      logger.error('SYSTEM', 'Lazy-spawn of worker failed', { runtimePath, scriptPath }, error);
-    } else {
-      logger.error('SYSTEM', 'Lazy-spawn of worker failed (non-Error)', {
-        runtimePath, scriptPath, error: String(error),
+  const spawnLock = acquireSpawnLock();
+  if (spawnLock) {
+    try {
+      const proc = spawnHidden(runtimePath, [scriptPath, '--daemon'], {
+        detached: true,
+        stdio: ['ignore', 'ignore', 'ignore'],
+        env: {
+          ...process.env,
+          CLAUDE_MEM_DATA_DIR: SettingsDefaultsManager.get('CLAUDE_MEM_DATA_DIR'),
+          CLAUDE_MEM_WORKER_PORT: String(configuredPort),
+        },
       });
+      proc.unref();
+    } catch (error: unknown) {
+      spawnLock.release();
+      if (error instanceof Error) {
+        logger.error('SYSTEM', 'Lazy-spawn of worker failed', { runtimePath, scriptPath }, error);
+      } else {
+        logger.error('SYSTEM', 'Lazy-spawn of worker failed (non-Error)', {
+          runtimePath, scriptPath, error: String(error),
+        });
+      }
+      return false;
     }
-    return false;
+  } else {
+    logger.info('SYSTEM', 'Worker spawn already in flight; waiting for concurrent spawn to bind');
   }
 
-  // Wait for the pidfile to report the actual bound port (worker may have
-  // walked off the configured port). Invalidate the cached port so subsequent
-  // worker calls resolve against the pidfile rather than the configured value.
+  // Wait for the pidfile to report the actual bound port. Works whether we
+  // spawned or another concurrent caller did. Invalidate the cached port so
+  // subsequent worker calls resolve against the pidfile.
   const boundPort = await waitForPidfilePort(getTimeout(HOOK_TIMEOUTS.POST_SPAWN_WAIT));
+  if (spawnLock) spawnLock.release();
   if (boundPort === null) {
     logger.warn('SYSTEM', 'Worker port did not open after lazy-spawn — pidfile not present');
     return false;

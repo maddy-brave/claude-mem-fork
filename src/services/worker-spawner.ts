@@ -4,6 +4,7 @@ import { existsSync, mkdirSync, writeFileSync, unlinkSync, statSync } from 'fs';
 import { logger } from '../utils/logger.js';
 import { HOOK_TIMEOUTS } from '../shared/hook-constants.js';
 import { SettingsDefaultsManager } from '../shared/SettingsDefaultsManager.js';
+import { acquireSpawnLock } from '../shared/spawn-lock.js';
 import {
   cleanStalePidFile,
   getPlatformTimeout,
@@ -127,18 +128,25 @@ export async function ensureWorkerStarted(
     return 'dead';
   }
 
-  logger.info('SYSTEM', 'Starting worker daemon', { workerScriptPath, configuredPort: port });
-  markWorkerSpawnAttempted();
-  const pid = spawnDaemon(workerScriptPath, port);
-  if (pid === undefined) {
-    logger.error('SYSTEM', 'Failed to spawn worker daemon');
-    return 'dead';
+  const spawnLock = acquireSpawnLock();
+  if (spawnLock) {
+    logger.info('SYSTEM', 'Starting worker daemon', { workerScriptPath, configuredPort: port });
+    markWorkerSpawnAttempted();
+    const pid = spawnDaemon(workerScriptPath, port);
+    if (pid === undefined) {
+      spawnLock.release();
+      logger.error('SYSTEM', 'Failed to spawn worker daemon');
+      return 'dead';
+    }
+  } else {
+    logger.info('SYSTEM', 'Another spawn in flight; waiting for concurrent worker to bind');
   }
 
-  // After spawn, the worker may have walked to a fallback port. Wait for the
-  // pidfile to appear, then poll its actual port for health/readiness rather
-  // than the configured port.
+  // After spawn (ours or concurrent), the worker may have walked to a fallback
+  // port. Wait for the pidfile to appear, then poll its actual port for
+  // health/readiness rather than the configured port.
   const boundPort = await waitForPidfilePort(getPlatformTimeout(HOOK_TIMEOUTS.POST_SPAWN_WAIT));
+  if (spawnLock) spawnLock.release();
   if (boundPort === null) {
     logger.warn('SYSTEM', 'Worker spawned but pidfile did not appear with a bound port — likely still starting in background');
     return 'warming';

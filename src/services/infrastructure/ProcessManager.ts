@@ -8,6 +8,7 @@ import { promisify } from 'util';
 import { logger } from '../../utils/logger.js';
 import { HOOK_TIMEOUTS } from '../../shared/hook-constants.js';
 import { sanitizeEnv } from '../../supervisor/env-sanitizer.js';
+import { SettingsDefaultsManager } from '../../shared/SettingsDefaultsManager.js';
 import { getSupervisor, validateWorkerPidFile, type ValidateWorkerPidStatus } from '../../supervisor/index.js';
 import { paths } from '../../shared/paths.js';
 
@@ -415,6 +416,7 @@ export function spawnDaemon(
   const env = sanitizeEnv({
     ...process.env,
     CLAUDE_MEM_WORKER_PORT: String(port),
+    CLAUDE_MEM_DATA_DIR: process.env.CLAUDE_MEM_DATA_DIR ?? SettingsDefaultsManager.get('CLAUDE_MEM_DATA_DIR'),
     ...extraEnv
   });
 

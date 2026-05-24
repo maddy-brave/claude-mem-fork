@@ -20,34 +20,22 @@ async function httpRequestToWorker(
   return { ok: response.ok, statusCode: response.status, body };
 }
 
-export async function isPortInUse(port: number): Promise<boolean> {
-  if (process.platform === 'win32') {
-    try {
-      const response = await fetch(`http://127.0.0.1:${port}/api/health`);
-      return response.ok;
-    } catch (error) {
-      if (error instanceof Error) {
-        logger.debug('SYSTEM', 'Windows health check failed (port not in use)', {}, error);
-      } else {
-        logger.debug('SYSTEM', 'Windows health check failed (port not in use)', { error: String(error) });
-      }
-      return false;
-    }
-  }
-
+// Kernel-level bind probe. Detects "is anything bound to this port", including
+// Windows TCP zombies (LISTENING socket attached to a dead PID with no userspace
+// owner). The Windows branch previously used a /api/health fetch which conflated
+// "worker healthy" with "port bound" — phantom listeners returned false and the
+// caller would happily spawn a new worker that immediately failed with
+// EADDRINUSE. Bind-probe is the only reliable cross-platform check.
+export async function isPortInUse(port: number, host: string = '127.0.0.1'): Promise<boolean> {
   return new Promise((resolve) => {
     const server = net.createServer();
     server.once('error', (err: NodeJS.ErrnoException) => {
-      if (err.code === 'EADDRINUSE') {
-        resolve(true);
-      } else {
-        resolve(false);
-      }
+      resolve(err.code === 'EADDRINUSE');
     });
     server.once('listening', () => {
       server.close(() => resolve(false));
     });
-    server.listen(port, '127.0.0.1');
+    server.listen(port, host);
   });
 }
 

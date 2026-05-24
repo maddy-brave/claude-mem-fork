@@ -7,6 +7,7 @@ import { SettingsDefaultsManager } from '../shared/SettingsDefaultsManager.js';
 import {
   cleanStalePidFile,
   getPlatformTimeout,
+  readPidFile,
   spawnDaemon,
   touchPidFile,
 } from './infrastructure/ProcessManager.js';
@@ -108,18 +109,17 @@ export async function ensureWorkerStarted(
     return ready ? 'ready' : 'warming';
   }
 
+  // Phantom listener (Windows kernel TCP zombie) on the configured port no
+  // longer aborts the spawn — the worker self-walks the port and binds the
+  // next available one. We still log so the user can see the configured port
+  // is unhealthy and choose to recover it.
   const portInUse = await isPortInUse(port);
   if (portInUse) {
-    logger.info('SYSTEM', 'Port in use, waiting for worker to become healthy');
-    const healthy = await waitForHealth(port, getPlatformTimeout(HOOK_TIMEOUTS.PORT_IN_USE_WAIT));
-    if (healthy) {
-      clearWorkerSpawnAttempted();
-      const ready = await waitForReadiness(port, getPlatformTimeout(HOOK_TIMEOUTS.READINESS_WAIT));
-      logger.info('SYSTEM', 'Worker is now healthy');
-      return ready ? 'ready' : 'warming';
-    }
-    logger.error('SYSTEM', 'Port in use but worker not responding to health checks');
-    return 'dead';
+    logger.warn(
+      'SYSTEM',
+      'Configured port has phantom listener — worker will walk to next available port',
+      { configuredPort: port, pidFileStatus }
+    );
   }
 
   if (shouldSkipSpawnOnWindows()) {
@@ -127,7 +127,7 @@ export async function ensureWorkerStarted(
     return 'dead';
   }
 
-  logger.info('SYSTEM', 'Starting worker daemon', { workerScriptPath });
+  logger.info('SYSTEM', 'Starting worker daemon', { workerScriptPath, configuredPort: port });
   markWorkerSpawnAttempted();
   const pid = spawnDaemon(workerScriptPath, port);
   if (pid === undefined) {
@@ -135,19 +135,43 @@ export async function ensureWorkerStarted(
     return 'dead';
   }
 
-  const healthy = await waitForHealth(port, getPlatformTimeout(HOOK_TIMEOUTS.POST_SPAWN_WAIT));
+  // After spawn, the worker may have walked to a fallback port. Wait for the
+  // pidfile to appear, then poll its actual port for health/readiness rather
+  // than the configured port.
+  const boundPort = await waitForPidfilePort(getPlatformTimeout(HOOK_TIMEOUTS.POST_SPAWN_WAIT));
+  if (boundPort === null) {
+    logger.warn('SYSTEM', 'Worker spawned but pidfile did not appear with a bound port — likely still starting in background');
+    return 'warming';
+  }
+  if (boundPort !== port) {
+    logger.info('SYSTEM', 'Worker bound fallback port', { configured: port, bound: boundPort });
+  }
+
+  const healthy = await waitForHealth(boundPort, getPlatformTimeout(HOOK_TIMEOUTS.POST_SPAWN_WAIT));
   if (!healthy) {
     logger.warn('SYSTEM', 'Worker spawned but health endpoint not responding within window — likely still starting in background');
     return 'warming';
   }
 
-  const ready = await waitForReadiness(port, getPlatformTimeout(HOOK_TIMEOUTS.READINESS_WAIT));
+  const ready = await waitForReadiness(boundPort, getPlatformTimeout(HOOK_TIMEOUTS.READINESS_WAIT));
   if (!ready) {
     logger.warn('SYSTEM', 'Worker is alive but readiness timed out — proceeding anyway');
   }
 
   clearWorkerSpawnAttempted();
   touchPidFile();
-  logger.info('SYSTEM', 'Worker started successfully');
+  logger.info('SYSTEM', 'Worker started successfully', { port: boundPort });
   return ready ? 'ready' : 'warming';
+}
+
+async function waitForPidfilePort(timeoutMs: number): Promise<number | null> {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const info = readPidFile();
+    if (info && typeof info.port === 'number' && info.port > 0) {
+      return info.port;
+    }
+    await new Promise(resolve => setTimeout(resolve, 250));
+  }
+  return null;
 }

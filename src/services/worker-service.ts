@@ -5,7 +5,7 @@ import { spawn } from 'child_process';
 import { Database } from 'bun:sqlite';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
-import { getWorkerPort, getWorkerHost } from '../shared/worker-utils.js';
+import { getWorkerPort, getWorkerHost, getConfiguredWorkerPort, WORKER_PORT_WALK_RANGE } from '../shared/worker-utils.js';
 import { DATA_DIR, DB_PATH, ensureDir } from '../shared/paths.js';
 import { HOOK_TIMEOUTS } from '../shared/hook-constants.js';
 import { SettingsDefaultsManager } from '../shared/SettingsDefaultsManager.js';
@@ -275,13 +275,51 @@ export class WorkerService implements WorkerRef {
   }
 
   async start(): Promise<void> {
-    const port = getWorkerPort();
+    const configuredPort = getConfiguredWorkerPort();
     const host = getWorkerHost();
 
     await startSupervisor();
     await this.sessionManager.initializeQueueEngine();
 
-    await this.server.listen(port, host);
+    // Port walk: try configured port first, then walk forward through
+    // [base+1 .. base+WORKER_PORT_WALK_RANGE-1] on EADDRINUSE. Survives Windows
+    // TCP zombies, multi-account collisions, and any other transient port-busy
+    // condition without requiring the user to edit settings. The actual bound
+    // port is written to the pidfile so clients can discover it.
+    let port = -1;
+    let lastBindError: Error | null = null;
+    for (let offset = 0; offset < WORKER_PORT_WALK_RANGE; offset++) {
+      const candidate = configuredPort + offset;
+      try {
+        await this.server.listen(candidate, host);
+        port = candidate;
+        break;
+      } catch (err) {
+        const code = (err as NodeJS.ErrnoException)?.code;
+        if (code === 'EADDRINUSE') {
+          lastBindError = err as Error;
+          logger.warn('SYSTEM', 'Port unavailable, walking to next candidate', {
+            attempted: candidate,
+            nextCandidate: candidate + 1 < configuredPort + WORKER_PORT_WALK_RANGE
+              ? candidate + 1
+              : null,
+          });
+          continue;
+        }
+        throw err;
+      }
+    }
+    if (port === -1) {
+      throw lastBindError ?? new Error(
+        `Worker failed to bind any port in range ${configuredPort}..${configuredPort + WORKER_PORT_WALK_RANGE - 1}`
+      );
+    }
+    if (port !== configuredPort) {
+      logger.warn('SYSTEM', 'Worker bound to fallback port (configured port unavailable)', {
+        configured: configuredPort,
+        bound: port,
+      });
+    }
 
     writePidFile({
       pid: process.pid,
@@ -1187,10 +1225,10 @@ async function main() {
         process.exit(0);
       }
 
-      if (await isPortInUse(port)) {
-        logger.info('SYSTEM', 'Port already in use, refusing to start duplicate', { port });
-        process.exit(0);
-      }
+      // Note: no early "port in use" guard here. The worker walks the port
+      // (see WorkerService.start) so a busy configured port is recoverable.
+      // Pidfile-based duplicate detection above already prevents two live
+      // workers from racing on the same port.
 
       process.on('unhandledRejection', (reason) => {
         logger.error('SYSTEM', 'Unhandled rejection in daemon', {

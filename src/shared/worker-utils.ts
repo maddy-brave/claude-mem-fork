@@ -8,6 +8,10 @@ import { SettingsDefaultsManager } from "./SettingsDefaultsManager.js";
 import { MARKETPLACE_ROOT, DATA_DIR } from "./paths.js";
 import { loadFromFileOnce } from "./hook-settings.js";
 import { validateWorkerPidFile } from "../supervisor/index.js";
+import { isPortInUse } from "../services/infrastructure/HealthMonitor.js";
+import { readPidFile, isProcessAlive } from "../services/infrastructure/ProcessManager.js";
+
+export const WORKER_PORT_WALK_RANGE = 10;
 
 function readTimeoutEnv(
   envName: string,
@@ -61,14 +65,34 @@ export function fetchWithTimeout(url: string, init: RequestInit = {}, timeoutMs:
 let cachedPort: number | null = null;
 let cachedHost: string | null = null;
 
+// Settings-resolved base port. Worker daemon uses this as the starting point
+// for port walking. Clients should normally call getWorkerPort() instead, which
+// honours the live pidfile if the worker bound a fallback port.
+export function getConfiguredWorkerPort(): number {
+  const settingsPath = path.join(SettingsDefaultsManager.get('CLAUDE_MEM_DATA_DIR'), 'settings.json');
+  const settings = SettingsDefaultsManager.loadFromFile(settingsPath);
+  return parseInt(settings.CLAUDE_MEM_WORKER_PORT, 10);
+}
+
+function readLivePidPort(): number | null {
+  const info = readPidFile();
+  if (!info || typeof info.port !== 'number' || typeof info.pid !== 'number') return null;
+  if (!isProcessAlive(info.pid)) return null;
+  return info.port;
+}
+
 export function getWorkerPort(): number {
   if (cachedPort !== null) {
     return cachedPort;
   }
 
-  const settingsPath = path.join(SettingsDefaultsManager.get('CLAUDE_MEM_DATA_DIR'), 'settings.json');
-  const settings = SettingsDefaultsManager.loadFromFile(settingsPath);
-  cachedPort = parseInt(settings.CLAUDE_MEM_WORKER_PORT, 10);
+  const fromPidfile = readLivePidPort();
+  if (fromPidfile !== null) {
+    cachedPort = fromPidfile;
+    return cachedPort;
+  }
+
+  cachedPort = getConfiguredWorkerPort();
   return cachedPort;
 }
 
@@ -218,17 +242,6 @@ function resolveBunRuntime(): string | null {
   }
 }
 
-async function waitForWorkerPort(options: { attempts: number; backoffMs: number }): Promise<boolean> {
-  let delayMs = options.backoffMs;
-  for (let attempt = 1; attempt <= options.attempts; attempt++) {
-    if (await isWorkerPortAlive()) return true;
-    if (attempt < options.attempts) {
-      await new Promise<void>(resolve => setTimeout(resolve, delayMs));
-      delayMs *= 2;
-    }
-  }
-  return false;
-}
 
 async function waitForWorkerReadiness(timeoutMs: number = HOOK_READINESS_TIMEOUT_MS): Promise<boolean> {
   if (timeoutMs <= 0) {
@@ -285,6 +298,21 @@ export async function ensureWorkerRunning(): Promise<boolean> {
     return true;
   }
 
+  // Configured port may have a phantom listener (Windows kernel TCP zombie)
+  // or be occupied by another worker. The worker daemon self-walks on
+  // EADDRINUSE, so we no longer bail here — we let the spawn proceed and
+  // discover the actual port via the pidfile afterwards.
+  const configuredPort = getConfiguredWorkerPort();
+  const host = getWorkerHost();
+  const pidStatus = validateWorkerPidFile({ logAlive: false });
+  if (pidStatus !== 'alive' && await isPortInUse(configuredPort, host)) {
+    logger.warn(
+      'SYSTEM',
+      'Configured port has phantom listener — worker will walk to next available port',
+      { configuredPort, host, pidStatus }
+    );
+  }
+
   const runtimePath = resolveBunRuntime();
   const scriptPath = resolveWorkerScriptPath();
 
@@ -297,12 +325,17 @@ export async function ensureWorkerRunning(): Promise<boolean> {
     return false;
   }
 
-  logger.info('SYSTEM', 'Worker not running — lazy-spawning', { runtimePath, scriptPath });
+  logger.info('SYSTEM', 'Worker not running — lazy-spawning', { runtimePath, scriptPath, configuredPort });
 
   try {
     const proc = spawnHidden(runtimePath, [scriptPath, '--daemon'], {
       detached: true,
       stdio: ['ignore', 'ignore', 'ignore'],
+      env: {
+        ...process.env,
+        CLAUDE_MEM_DATA_DIR: SettingsDefaultsManager.get('CLAUDE_MEM_DATA_DIR'),
+        CLAUDE_MEM_WORKER_PORT: String(configuredPort),
+      },
     });
     proc.unref();
   } catch (error: unknown) {
@@ -316,17 +349,37 @@ export async function ensureWorkerRunning(): Promise<boolean> {
     return false;
   }
 
-  const alive = await waitForWorkerPort({ attempts: 3, backoffMs: 250 });
-  if (!alive) {
-    logger.warn('SYSTEM', 'Worker port did not open after lazy-spawn within 3 attempts');
+  // Wait for the pidfile to report the actual bound port (worker may have
+  // walked off the configured port). Invalidate the cached port so subsequent
+  // worker calls resolve against the pidfile rather than the configured value.
+  const boundPort = await waitForPidfilePort(getTimeout(HOOK_TIMEOUTS.POST_SPAWN_WAIT));
+  if (boundPort === null) {
+    logger.warn('SYSTEM', 'Worker port did not open after lazy-spawn — pidfile not present');
     return false;
   }
+  if (boundPort !== configuredPort) {
+    logger.info('SYSTEM', 'Worker bound fallback port', { configured: configuredPort, bound: boundPort });
+  }
+  clearPortCache();
+
   const ready = await waitForWorkerReadiness();
   if (!ready) {
     logger.warn('SYSTEM', 'Worker lazy-spawned but did not become ready before hook readiness timeout');
     return false;
   }
   return true;
+}
+
+async function waitForPidfilePort(timeoutMs: number): Promise<number | null> {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const info = readPidFile();
+    if (info && typeof info.port === 'number' && info.port > 0 && typeof info.pid === 'number' && isProcessAlive(info.pid)) {
+      return info.port;
+    }
+    await new Promise(resolve => setTimeout(resolve, 250));
+  }
+  return null;
 }
 
 let aliveCache: boolean | null = null;

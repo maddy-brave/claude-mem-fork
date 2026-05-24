@@ -472,7 +472,8 @@ function getTreeSitterBin(): string {
 
   try {
     const pkgPath = _require.resolve("tree-sitter-cli/package.json");
-    const binPath = join(dirname(pkgPath), "tree-sitter");
+    const binName = process.platform === "win32" ? "tree-sitter.exe" : "tree-sitter";
+    const binPath = join(dirname(pkgPath), binName);
     if (existsSync(binPath)) {
       cachedBinPath = binPath;
       return binPath;
@@ -481,7 +482,7 @@ function getTreeSitterBin(): string {
     // [ANTI-PATTERN IGNORED]: tree-sitter-cli not in node_modules is expected; falls back to PATH
   }
 
-  cachedBinPath = "tree-sitter";
+  cachedBinPath = process.platform === "win32" ? "tree-sitter.exe" : "tree-sitter";
   return cachedBinPath;
 }
 

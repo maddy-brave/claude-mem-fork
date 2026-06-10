@@ -1,11 +1,11 @@
 import { spawnHidden } from '../../shared/spawn.js';
+import { sanitizeEnv } from '../../supervisor/env-sanitizer.js';
 import { existsSync } from 'fs';
 import { join } from 'path';
 import pc from 'picocolors';
 import { resolveBunBinaryPath } from '../utils/bun-resolver.js';
 import { isPluginInstalled, marketplaceDirectory } from '../utils/paths.js';
 import { SettingsDefaultsManager } from '../../shared/SettingsDefaultsManager.js';
-import { sanitizeEnv } from '../../supervisor/env-sanitizer.js';
 
 function ensureInstalledOrExit(): void {
   if (!isPluginInstalled()) {
@@ -50,11 +50,10 @@ function spawnBunWorkerCommand(command: string, extraArgs: string[] = []): void 
   const child = spawnHidden(bunPath, args, {
     stdio: 'inherit',
     cwd: marketplaceDirectory(),
-    env: sanitizeEnv({
-      ...process.env,
-      CLAUDE_MEM_DATA_DIR: process.env.CLAUDE_MEM_DATA_DIR ?? SettingsDefaultsManager.get('CLAUDE_MEM_DATA_DIR'),
-      CLAUDE_MEM_WORKER_PORT: String(SettingsDefaultsManager.get('CLAUDE_MEM_WORKER_PORT')),
-    }),
+    // Sanitize host CLI bleed-through and Anthropic credentials before
+    // launching the Bun worker/server/transcript process. Credentials are
+    // re-read from ~/.claude-mem/.env at SDK spawn time (#2357 / #2375).
+    env: sanitizeEnv(process.env),
   });
 
   child.on('error', (error) => {
@@ -81,11 +80,10 @@ function spawnBunServerBetaCommand(command: string, extraArgs: string[] = []): v
   const child = spawnHidden(bunPath, [serverScript, command, ...extraArgs], {
     stdio: 'inherit',
     cwd: marketplaceDirectory(),
-    env: sanitizeEnv({
-      ...process.env,
-      CLAUDE_MEM_DATA_DIR: process.env.CLAUDE_MEM_DATA_DIR ?? SettingsDefaultsManager.get('CLAUDE_MEM_DATA_DIR'),
-      CLAUDE_MEM_WORKER_PORT: String(SettingsDefaultsManager.get('CLAUDE_MEM_WORKER_PORT')),
-    }),
+    // Sanitize host CLI bleed-through and Anthropic credentials before
+    // launching the Bun worker/server/transcript process. Credentials are
+    // re-read from ~/.claude-mem/.env at SDK spawn time (#2357 / #2375).
+    env: sanitizeEnv(process.env),
   });
 
   child.on('error', (error) => {
@@ -158,11 +156,10 @@ export function runAdoptCommand(extraArgs: string[] = []): void {
   const child = spawnHidden(bunPath, args, {
     stdio: 'inherit',
     cwd: marketplaceDirectory(),
-    env: sanitizeEnv({
-      ...process.env,
-      CLAUDE_MEM_DATA_DIR: process.env.CLAUDE_MEM_DATA_DIR ?? SettingsDefaultsManager.get('CLAUDE_MEM_DATA_DIR'),
-      CLAUDE_MEM_WORKER_PORT: String(SettingsDefaultsManager.get('CLAUDE_MEM_WORKER_PORT')),
-    }),
+    // Sanitize host CLI bleed-through and Anthropic credentials before
+    // launching the Bun worker/server/transcript process. Credentials are
+    // re-read from ~/.claude-mem/.env at SDK spawn time (#2357 / #2375).
+    env: sanitizeEnv(process.env),
   });
 
   child.on('error', (error) => {
@@ -251,11 +248,10 @@ export function runTranscriptWatchCommand(): void {
   const child = spawnHidden(bunPath, [transcriptWatcherPath, 'watch'], {
     stdio: 'inherit',
     cwd: marketplaceDirectory(),
-    env: sanitizeEnv({
-      ...process.env,
-      CLAUDE_MEM_DATA_DIR: process.env.CLAUDE_MEM_DATA_DIR ?? SettingsDefaultsManager.get('CLAUDE_MEM_DATA_DIR'),
-      CLAUDE_MEM_WORKER_PORT: String(SettingsDefaultsManager.get('CLAUDE_MEM_WORKER_PORT')),
-    }),
+    // Sanitize host CLI bleed-through and Anthropic credentials before
+    // launching the Bun worker/server/transcript process. Credentials are
+    // re-read from ~/.claude-mem/.env at SDK spawn time (#2357 / #2375).
+    env: sanitizeEnv(process.env),
   });
 
   child.on('error', (error) => {

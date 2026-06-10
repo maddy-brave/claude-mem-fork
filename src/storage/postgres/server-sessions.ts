@@ -137,6 +137,27 @@ export class PostgresServerSessionsRepository {
     return row ? mapServerSessionRow(row) : null;
   }
 
+  // Resolve only the server_session id for a content session. Used by the
+  // /v1/events ingest linkage path, which needs nothing but the id, so we select
+  // a single column to keep this hot-path query light.
+  async findIdByContentSessionId(input: {
+    contentSessionId: string;
+    projectId: string;
+    teamId: string;
+  }): Promise<string | null> {
+    const row = await queryOne<{ id: string }>(
+      this.client,
+      `
+        SELECT id FROM server_sessions
+        WHERE content_session_id = $1 AND project_id = $2 AND team_id = $3
+        ORDER BY started_at DESC
+        LIMIT 1
+      `,
+      [input.contentSessionId, input.projectId, input.teamId]
+    );
+    return row ? row.id : null;
+  }
+
   /**
    * End a server session by setting `ended_at = now()` if not already set.
    * Idempotent: if `ended_at` is already populated, returns the row unchanged.
@@ -270,6 +291,7 @@ interface UnprocessedEventRow {
   source_event_id: string | null;
   idempotency_key: string;
   event_type: string;
+  platform_source: string | null;
   payload: unknown;
   metadata: unknown;
   occurred_at: Date;
@@ -287,6 +309,7 @@ function mapUnprocessedEventRow(row: UnprocessedEventRow): PostgresAgentEvent {
     sourceEventId: row.source_event_id,
     idempotencyKey: row.idempotency_key,
     eventType: row.event_type,
+    platformSource: row.platform_source,
     payload: toJsonObject(row.payload),
     metadata: toJsonObject(row.metadata),
     occurredAtEpoch: row.occurred_at.getTime(),

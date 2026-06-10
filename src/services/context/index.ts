@@ -1,5 +1,6 @@
 
-export { generateContext } from './ContextBuilder.js';
+export { generateContext, generateContextWithStats } from './ContextBuilder.js';
+export type { ContextInjectStats } from './ContextBuilder.js';
 export type { ContextInput, ContextConfig } from './types.js';
 
 export { loadContextConfig } from './ContextConfigLoader.js';
@@ -9,4 +10,5 @@ export {
   querySummaries,
   buildTimeline,
   getPriorSessionMessages,
+  cwdToDashed,
 } from './ObservationCompiler.js';

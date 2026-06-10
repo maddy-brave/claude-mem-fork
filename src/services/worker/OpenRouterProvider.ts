@@ -1,6 +1,7 @@
 
 import { buildContinuationPrompt, buildInitPrompt, buildObservationPrompt, buildSummaryPrompt } from '../../sdk/prompts.js';
 import { getCredential } from '../../shared/EnvManager.js';
+import { resolveOpenRouterChatCompletionsUrl } from '../../shared/openrouter-base-url.js';
 import { SettingsDefaultsManager } from '../../shared/SettingsDefaultsManager.js';
 import { USER_SETTINGS_PATH } from '../../shared/paths.js';
 import { logger } from '../../utils/logger.js';
@@ -17,7 +18,17 @@ import {
 import { ClassifiedProviderError } from './provider-errors.js';
 import { withRetry } from './retry.js';
 
-const OPENROUTER_API_URL = 'https://openrouter.ai/api/v1/chat/completions';
+/**
+ * OpenAI-compatible client configuration.
+ *
+ * The endpoint is resolved from CLAUDE_MEM_OPENROUTER_BASE_URL (settings or env;
+ * env var OPENROUTER_BASE_URL also honored). When unset, requests go to the
+ * default OpenRouter URL — behavior unchanged. When set to an OpenAI-compatible
+ * base (DeepSeek, LM Studio, a custom gateway, etc.), the provider POSTs to
+ * `<base>/chat/completions`. The model is taken verbatim from
+ * CLAUDE_MEM_OPENROUTER_MODEL. See src/shared/openrouter-base-url.ts for the
+ * resolution rules and per-provider config examples (#2382/#2590/#2622/#2393).
+ */
 
 /**
  * Parse Retry-After header (seconds or HTTP-date). Returns ms or undefined.
@@ -117,6 +128,8 @@ interface OpenAIMessage {
 }
 
 interface OpenRouterResponse {
+  /** The model that actually served the request — not the configured string. */
+  model?: string;
   choices?: Array<{
     message?: {
       role?: string;
@@ -128,10 +141,43 @@ interface OpenRouterResponse {
     prompt_tokens?: number;
     completion_tokens?: number;
     total_tokens?: number;
+    /** Credits charged by openrouter.ai (~USD). With BYOK this is only the fee. */
+    cost?: number;
+    cost_details?: {
+      /** What the upstream provider charged when using BYOK. */
+      upstream_inference_cost?: number;
+    };
   };
   error?: {
     message?: string;
     code?: string;
+  };
+}
+
+interface OpenRouterQueryResult {
+  content: string;
+  tokensUsed?: number;
+  inputTokens?: number;
+  outputTokens?: number;
+  /** Real provider-reported spend in USD (openrouter.ai only — custom gateways omit it). */
+  costUsd?: number;
+  /** response.model — the model that actually served the request. */
+  servedModel?: string;
+}
+
+/**
+ * Real usage only, both sides or nothing: a gateway that reports just one of
+ * prompt/completion tokens must not produce a half-real event (a lone
+ * completion count used to surface as tokens_input=0 → compression_ratio 0.0).
+ */
+function buildLastUsage(response: OpenRouterQueryResult): ActiveSession['lastUsage'] {
+  if (typeof response.inputTokens !== 'number' || typeof response.outputTokens !== 'number') {
+    return null;
+  }
+  return {
+    input: response.inputTokens,
+    output: response.outputTokens,
+    ...(typeof response.costUsd === 'number' ? { costUsd: response.costUsd } : {}),
   };
 }
 
@@ -145,7 +191,11 @@ export class OpenRouterProvider {
   }
 
   async startSession(session: ActiveSession, worker?: WorkerRef): Promise<void> {
-    const { apiKey, model, siteUrl, appName } = this.getOpenRouterConfig();
+    const { apiKey, model, apiUrl, siteUrl, appName } = this.getOpenRouterConfig();
+    session.lastModelId = model;
+    // openrouter.ai responses carry real usage/cost; custom OpenAI-compatible
+    // gateways often fabricate or omit usage — let telemetry segment the two.
+    session.endpointClass = apiUrl.includes('openrouter.ai') ? 'openrouter' : 'custom';
 
     if (!apiKey) {
       throw new Error('OpenRouter API key not configured. Set CLAUDE_MEM_OPENROUTER_API_KEY in settings or OPENROUTER_API_KEY environment variable.');
@@ -167,7 +217,9 @@ export class OpenRouterProvider {
     session.conversationHistory.push({ role: 'user', content: initPrompt });
 
     try {
-      const initResponse = await this.queryOpenRouterMultiTurn(session.conversationHistory, apiKey, model, siteUrl, appName);
+      session.lastPromptSentAt = Date.now();
+      session.lastGeneratorSource = 'init';
+      const initResponse = await this.queryOpenRouterMultiTurn(session.conversationHistory, apiKey, model, apiUrl, siteUrl, appName);
       await this.handleInitResponse(initResponse, session, worker, model);
     } catch (error: unknown) {
       if (error instanceof Error) {
@@ -183,7 +235,7 @@ export class OpenRouterProvider {
 
     try {
       for await (const message of this.sessionManager.getMessageIterator(session.sessionDbId)) {
-        lastCwd = await this.processOneMessage(session, message, lastCwd, apiKey, model, siteUrl, appName, worker, mode);
+        lastCwd = await this.processOneMessage(session, message, lastCwd, apiKey, model, apiUrl, siteUrl, appName, worker, mode);
       }
     } catch (error: unknown) {
       if (error instanceof Error) {
@@ -210,7 +262,7 @@ export class OpenRouterProvider {
   }
 
   private async handleInitResponse(
-    initResponse: { content: string; tokensUsed?: number },
+    initResponse: OpenRouterQueryResult,
     session: ActiveSession,
     worker: WorkerRef | undefined,
     model: string
@@ -220,10 +272,11 @@ export class OpenRouterProvider {
       const tokensUsed = initResponse.tokensUsed || 0;
       session.cumulativeInputTokens += Math.floor(tokensUsed * 0.7);
       session.cumulativeOutputTokens += Math.floor(tokensUsed * 0.3);
+      session.lastUsage = buildLastUsage(initResponse);
 
       await processAgentResponse(
         initResponse.content, session, this.dbManager, this.sessionManager,
-        worker, tokensUsed, null, 'OpenRouter', undefined, model
+        worker, tokensUsed, null, 'OpenRouter', undefined, initResponse.servedModel ?? model
       );
     } else {
       logger.error('SDK', 'Empty OpenRouter init response - session may lack context', {
@@ -238,6 +291,7 @@ export class OpenRouterProvider {
     lastCwd: string | undefined,
     apiKey: string,
     model: string,
+    apiUrl: string,
     siteUrl: string | undefined,
     appName: string | undefined,
     worker: WorkerRef | undefined,
@@ -253,12 +307,12 @@ export class OpenRouterProvider {
     if (message.type === 'observation') {
       await this.processObservationMessage(
         session, message, originalTimestamp, lastCwd,
-        apiKey, model, siteUrl, appName, worker, mode
+        apiKey, model, apiUrl, siteUrl, appName, worker, mode
       );
     } else if (message.type === 'summarize') {
       await this.processSummaryMessage(
         session, message, originalTimestamp, lastCwd,
-        apiKey, model, siteUrl, appName, worker, mode
+        apiKey, model, apiUrl, siteUrl, appName, worker, mode
       );
     }
 
@@ -272,6 +326,7 @@ export class OpenRouterProvider {
     lastCwd: string | undefined,
     apiKey: string,
     model: string,
+    apiUrl: string,
     siteUrl: string | undefined,
     appName: string | undefined,
     worker: WorkerRef | undefined,
@@ -295,7 +350,9 @@ export class OpenRouterProvider {
     });
 
     session.conversationHistory.push({ role: 'user', content: obsPrompt });
-    const obsResponse = await this.queryOpenRouterMultiTurn(session.conversationHistory, apiKey, model, siteUrl, appName);
+    session.lastPromptSentAt = Date.now();
+    session.lastGeneratorSource = 'ingest';
+    const obsResponse = await this.queryOpenRouterMultiTurn(session.conversationHistory, apiKey, model, apiUrl, siteUrl, appName);
 
     let tokensUsed = 0;
     if (obsResponse.content) {
@@ -303,11 +360,12 @@ export class OpenRouterProvider {
       tokensUsed = obsResponse.tokensUsed || 0;
       session.cumulativeInputTokens += Math.floor(tokensUsed * 0.7);
       session.cumulativeOutputTokens += Math.floor(tokensUsed * 0.3);
+      session.lastUsage = buildLastUsage(obsResponse);
     }
 
     await processAgentResponse(
       obsResponse.content || '', session, this.dbManager, this.sessionManager,
-      worker, tokensUsed, originalTimestamp, 'OpenRouter', lastCwd, model
+      worker, tokensUsed, originalTimestamp, 'OpenRouter', lastCwd, obsResponse.servedModel ?? model
     );
   }
 
@@ -318,6 +376,7 @@ export class OpenRouterProvider {
     lastCwd: string | undefined,
     apiKey: string,
     model: string,
+    apiUrl: string,
     siteUrl: string | undefined,
     appName: string | undefined,
     worker: WorkerRef | undefined,
@@ -336,7 +395,9 @@ export class OpenRouterProvider {
     }, mode);
 
     session.conversationHistory.push({ role: 'user', content: summaryPrompt });
-    const summaryResponse = await this.queryOpenRouterMultiTurn(session.conversationHistory, apiKey, model, siteUrl, appName);
+    session.lastPromptSentAt = Date.now();
+    session.lastGeneratorSource = 'summarize';
+    const summaryResponse = await this.queryOpenRouterMultiTurn(session.conversationHistory, apiKey, model, apiUrl, siteUrl, appName);
 
     let tokensUsed = 0;
     if (summaryResponse.content) {
@@ -344,11 +405,12 @@ export class OpenRouterProvider {
       tokensUsed = summaryResponse.tokensUsed || 0;
       session.cumulativeInputTokens += Math.floor(tokensUsed * 0.7);
       session.cumulativeOutputTokens += Math.floor(tokensUsed * 0.3);
+      session.lastUsage = buildLastUsage(summaryResponse);
     }
 
     await processAgentResponse(
       summaryResponse.content || '', session, this.dbManager, this.sessionManager,
-      worker, tokensUsed, originalTimestamp, 'OpenRouter', lastCwd, model
+      worker, tokensUsed, originalTimestamp, 'OpenRouter', lastCwd, summaryResponse.servedModel ?? model
     );
   }
 
@@ -415,9 +477,10 @@ export class OpenRouterProvider {
     history: ConversationMessage[],
     apiKey: string,
     model: string,
+    apiUrl: string,
     siteUrl?: string,
     appName?: string
-  ): Promise<{ content: string; tokensUsed?: number }> {
+  ): Promise<OpenRouterQueryResult> {
     const truncatedHistory = this.truncateHistory(history);
     const messages = this.conversationToOpenAIMessages(truncatedHistory);
     const totalChars = truncatedHistory.reduce((sum, m) => sum + m.content.length, 0);
@@ -434,7 +497,7 @@ export class OpenRouterProvider {
     const data = await withRetry<OpenRouterResponse>(async (attemptSignal) => {
       let response: Response;
       try {
-        response = await fetch(OPENROUTER_API_URL, {
+        response = await fetch(apiUrl, {
           method: 'POST',
           headers: {
             'Authorization': `Bearer ${apiKey}`,
@@ -448,6 +511,10 @@ export class OpenRouterProvider {
             messages,
             temperature: 0.3,  // Lower temperature for structured extraction
             max_tokens: 4096,
+            // Ask openrouter.ai for usage accounting (token counts + cost).
+            // Only sent to openrouter.ai — strict custom gateways may reject
+            // unknown body fields.
+            ...(apiUrl.includes('openrouter.ai') ? { usage: { include: true } } : {}),
           }),
           signal: attemptSignal,
         });
@@ -495,44 +562,68 @@ export class OpenRouterProvider {
 
     const content = data.choices[0].message.content;
     const tokensUsed = data.usage?.total_tokens;
+    const realInputTokens = data.usage?.prompt_tokens;
+    const realOutputTokens = data.usage?.completion_tokens;
+    // usage.cost is what openrouter.ai charged in credits (~USD); with BYOK the
+    // model spend is reported separately as upstream_inference_cost. Custom
+    // gateways usually omit both — costUsd stays undefined (never estimated).
+    const orCost = typeof data.usage?.cost === 'number' ? data.usage.cost : undefined;
+    const upstreamCost = typeof data.usage?.cost_details?.upstream_inference_cost === 'number'
+      ? data.usage.cost_details.upstream_inference_cost
+      : undefined;
+    const costUsd = orCost !== undefined || upstreamCost !== undefined
+      ? (orCost ?? 0) + (upstreamCost ?? 0)
+      : undefined;
+    const servedModel = typeof data.model === 'string' && data.model ? data.model : undefined;
 
     if (tokensUsed) {
-      const inputTokens = data.usage?.prompt_tokens || 0;
-      const outputTokens = data.usage?.completion_tokens || 0;
-      const estimatedCost = (inputTokens / 1000000 * 3) + (outputTokens / 1000000 * 15);
-
       logger.info('SDK', 'OpenRouter API usage', {
-        model,
-        inputTokens,
-        outputTokens,
+        model: servedModel ?? model,
+        inputTokens: realInputTokens || 0,
+        outputTokens: realOutputTokens || 0,
         totalTokens: tokensUsed,
-        estimatedCostUSD: estimatedCost.toFixed(4),
+        ...(costUsd !== undefined ? { costUSD: costUsd.toFixed(6) } : {}),
         messagesInContext: truncatedHistory.length
       });
 
       if (tokensUsed > 50000) {
         logger.warn('SDK', 'High token usage detected - consider reducing context', {
           totalTokens: tokensUsed,
-          estimatedCost: estimatedCost.toFixed(4)
+          ...(costUsd !== undefined ? { costUSD: costUsd.toFixed(6) } : {}),
         });
       }
     }
 
-    return { content, tokensUsed };
+    return { content, tokensUsed, inputTokens: realInputTokens, outputTokens: realOutputTokens, costUsd, servedModel };
   }
 
-  private getOpenRouterConfig(): { apiKey: string; model: string; siteUrl?: string; appName?: string } {
+  private getOpenRouterConfig(): { apiKey: string; model: string; apiUrl: string; siteUrl?: string; appName?: string } {
     const settingsPath = USER_SETTINGS_PATH;
     const settings = SettingsDefaultsManager.loadFromFile(settingsPath);
 
     const apiKey = settings.CLAUDE_MEM_OPENROUTER_API_KEY || getCredential('OPENROUTER_API_KEY') || '';
 
-    const model = settings.CLAUDE_MEM_OPENROUTER_MODEL || 'xiaomi/mimo-v2-flash:free';
+    // Model is passed verbatim — any OpenAI-compatible model id is accepted
+    // (e.g. deepseek-chat, an LM Studio local model). #2393. Settings are raw
+    // JSON passthrough, so coerce non-string spellings (e.g. a JSON-array
+    // fallback list) to a string instead of leaking them downstream, where
+    // the telemetry scrubber drops non-string model values silently.
+    const rawModel: unknown = settings.CLAUDE_MEM_OPENROUTER_MODEL;
+    const model = typeof rawModel === 'string' && rawModel.trim()
+      ? rawModel
+      : Array.isArray(rawModel) && rawModel.length > 0
+        ? rawModel.map(String).join(',')
+        : 'xiaomi/mimo-v2-flash:free';
+
+    // Base URL: settings value wins, then OPENROUTER_BASE_URL env var, else
+    // the default OpenRouter endpoint (unchanged behavior). #2382/#2590/#2622/#2393.
+    const baseUrl = settings.CLAUDE_MEM_OPENROUTER_BASE_URL || process.env.OPENROUTER_BASE_URL || '';
+    const apiUrl = resolveOpenRouterChatCompletionsUrl(baseUrl);
 
     const siteUrl = settings.CLAUDE_MEM_OPENROUTER_SITE_URL || '';
     const appName = settings.CLAUDE_MEM_OPENROUTER_APP_NAME || 'claude-mem';
 
-    return { apiKey, model, siteUrl, appName };
+    return { apiKey, model, apiUrl, siteUrl, appName };
   }
 }
 

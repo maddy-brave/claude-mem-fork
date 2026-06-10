@@ -196,6 +196,17 @@ describe('Codex CLI Compatibility (#744)', () => {
       });
     });
 
+    it('omits suppressOutput from base Codex output', async () => {
+      const { codexAdapter } = await import('../src/cli/adapters/codex.js');
+      const output = codexAdapter.formatOutput({
+        continue: true,
+        suppressOutput: true,
+      }) as any;
+
+      expect(output).toEqual({ continue: true });
+      expect(output).not.toHaveProperty('suppressOutput');
+    });
+
     it('does not emit hookSpecificOutput for Stop outputs', async () => {
       const { codexAdapter } = await import('../src/cli/adapters/codex.js');
       const output = codexAdapter.formatOutput({
@@ -207,7 +218,7 @@ describe('Codex CLI Compatibility (#744)', () => {
         },
       }) as any;
 
-      expect(output).toEqual({ continue: true, suppressOutput: true });
+      expect(output).toEqual({ continue: true });
     });
   });
 
@@ -463,20 +474,29 @@ describe('Hook Lifecycle - Standard Response', () => {
   });
 });
 
-describe('hookCommand - stderr suppression', () => {
-  it('should not use console.error for worker unavailable errors', async () => {
+describe('hookCommand - stderr discipline (plan 01 / #2292)', () => {
+  it('routes all IO through hook-io.ts and no longer blanket-swallows stderr', async () => {
     const { hookCommand } = await import('../src/cli/hook-command.js');
+    expect(typeof hookCommand).toBe('function');
 
     const hookCommandSource = await Bun.file(
       new URL('../src/cli/hook-command.ts', import.meta.url).pathname
     ).text();
 
+    // Diagnostics still go through the structured logger.
     expect(hookCommandSource).toContain("import { logger }");
     expect(hookCommandSource).toContain("logger.warn('HOOK'");
     expect(hookCommandSource).toContain("logger.error('HOOK'");
-    expect(hookCommandSource).toContain("process.stderr.write = (() => true)");
-    expect(hookCommandSource).toContain("process.stderr.write = originalStderrWrite");
+
+    // #2292: the old blanket no-op swallow is GONE — replaced by the typed
+    // buffered writer + bypass channel from src/shared/hook-io.ts.
+    expect(hookCommandSource).not.toContain("process.stderr.write = (() => true)");
+    expect(hookCommandSource).toContain("installHookStderrBuffer");
+
+    // hookCommand orchestrates hook-io; it does not write streams directly.
+    expect(hookCommandSource).toContain("emitModelContext");
+    expect(hookCommandSource).toContain("emitBlockingError");
+    expect(hookCommandSource).toContain("exitGraceful");
     expect(hookCommandSource).not.toContain("console.error(`[claude-mem]");
-    expect(hookCommandSource).not.toContain("console.error(`Hook error:");
   });
 });

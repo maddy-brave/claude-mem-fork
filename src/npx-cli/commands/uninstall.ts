@@ -14,7 +14,52 @@ import {
 } from '../utils/paths.js';
 import { readJsonSafe } from '../../utils/json-utils.js';
 import { SettingsDefaultsManager } from '../../shared/SettingsDefaultsManager.js';
+import { USER_SETTINGS_PATH } from '../../shared/paths.js';
 import { shutdownWorkerAndWait } from '../../services/install/shutdown-helper.js';
+import {
+  normalizeRuntimeFlag,
+  planServerRuntimeUninstall,
+  type InstallRuntimeId,
+} from './server-runtime-setup.js';
+import { captureCliEvent } from '../../services/telemetry/cli-telemetry.js';
+
+// #2568 — read the runtime the operator installed so uninstall can dispatch to
+// the matching teardown. The worker path is the default and is unchanged: only
+// when the recorded runtime is the server runtime do we run the extra teardown.
+function readSelectedRuntime(): InstallRuntimeId {
+  try {
+    const settings = SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH);
+    return normalizeRuntimeFlag(settings.CLAUDE_MEM_RUNTIME) ?? 'worker';
+  } catch {
+    return 'worker';
+  }
+}
+
+function clearServerRuntimeSettings(keys: readonly string[]): void {
+  if (!existsSync(USER_SETTINGS_PATH)) return;
+  let raw: Record<string, unknown>;
+  try {
+    raw = JSON.parse(readFileSync(USER_SETTINGS_PATH, 'utf-8')) as Record<string, unknown>;
+  } catch (error: unknown) {
+    console.warn('[uninstall] Could not read settings for server runtime cleanup:', error instanceof Error ? error.message : String(error));
+    return;
+  }
+  const flat = (raw.env && typeof raw.env === 'object' ? raw.env : raw) as Record<string, unknown>;
+  let changed = false;
+  for (const key of keys) {
+    if (key in flat) {
+      delete flat[key];
+      changed = true;
+    }
+  }
+  if (changed) {
+    try {
+      writeFileSync(USER_SETTINGS_PATH, JSON.stringify(flat, null, 2), 'utf-8');
+    } catch (error: unknown) {
+      console.warn('[uninstall] Could not write settings during server runtime cleanup:', error instanceof Error ? error.message : String(error));
+    }
+  }
+}
 
 function removeMarketplaceDirectory(): boolean {
   const marketplaceDir = marketplaceDirectory();
@@ -81,10 +126,42 @@ function stripLegacyClaudeMemAlias(): void {
   }
 }
 
-function removeFromClaudeSettings(): void {
+export function removeFromClaudeSettings(): void {
   const settings = readJsonSafe<Record<string, any>>(claudeSettingsPath(), {});
+  let dirty = false;
+
   if (settings.enabledPlugins?.['claude-mem@thedotmack'] !== undefined) {
     delete settings.enabledPlugins['claude-mem@thedotmack'];
+    dirty = true;
+  }
+
+  // Symmetric counterpart to disableClaudeAutoMemory() in install.ts. The
+  // installer sets env.CLAUDE_CODE_DISABLE_AUTO_MEMORY = "1" to suppress
+  // Claude Code's built-in auto-memory; on uninstall we restore the host
+  // CLI's default behavior by removing that key. The value-equality guard
+  // (=== '1') ensures we only strip the specific token the installer wrote
+  // — if a user had pre-set this key to something else (e.g. '0' to force
+  // auto-memory on), or to '1' themselves before installing claude-mem,
+  // their intent is preserved. The installer's own no-op-when-already-'1'
+  // path means the worst case is leaving behind a value claude-mem would
+  // have written anyway. Any other env entries the user added themselves
+  // (ANTHROPIC_AUTH_TOKEN, AWS_REGION, etc.) are preserved. If the env
+  // block becomes empty as a result, the block itself is dropped to keep
+  // settings.json tidy.
+  if (settings.env && typeof settings.env === 'object' && !Array.isArray(settings.env)) {
+    if (
+      Object.prototype.hasOwnProperty.call(settings.env, 'CLAUDE_CODE_DISABLE_AUTO_MEMORY') &&
+      settings.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY === '1'
+    ) {
+      delete settings.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY;
+      dirty = true;
+      if (Object.keys(settings.env).length === 0) {
+        delete settings.env;
+      }
+    }
+  }
+
+  if (dirty) {
     writeJsonFileAtomic(claudeSettingsPath(), settings);
   }
 }
@@ -198,6 +275,29 @@ export async function runUninstallCommand(): Promise<void> {
     console.warn('[uninstall] Worker shutdown attempt failed:', error instanceof Error ? error.message : String(error));
   }
 
+  // #2568 — server-runtime teardown. Gated on the installed/selected runtime so
+  // the worker uninstall path is completely unchanged. The bundled Docker
+  // compose stack lives under the marketplace dir; if it's present we treat the
+  // stack as locally managed and instruct teardown (the actual `docker compose
+  // down -v` is an operator/CI side effect, not run from this Node process).
+  const selectedRuntime = readSelectedRuntime();
+  const dockerStackManaged = existsSync(join(marketplaceDirectory(), 'docker-compose.yml'));
+  const serverPlan = planServerRuntimeUninstall({ selectedRuntime, dockerStackManaged });
+  if (serverPlan.isServerRuntime) {
+    if (serverPlan.tearDownDockerStack) {
+      p.log.info(
+        'Server runtime detected. Tear down the bundled stack with '
+          + '`docker compose down -v --remove-orphans` (stops + removes pg + redis/valkey).',
+      );
+    } else {
+      p.log.info('Server runtime detected (externally managed stack — leaving Docker/pg/redis untouched).');
+    }
+    if (serverPlan.clearServerSettings) {
+      clearServerRuntimeSettings(serverPlan.settingsKeysToClear);
+      p.log.info('Server runtime settings cleared from ~/.claude-mem/settings.json.');
+    }
+  }
+
   await p.tasks([
     {
       title: 'Removing marketplace directory',
@@ -297,6 +397,10 @@ export async function runUninstallCommand(): Promise<void> {
     ].join('\n'),
     'Note',
   );
+
+  // Capture BEFORE the data dir note becomes stale advice: consent and the
+  // install ID still live in ~/.claude-mem, which uninstall preserves.
+  await captureCliEvent('uninstall_completed', {}, { person: true });
 
   p.outro(pc.green('claude-mem has been uninstalled.'));
 }

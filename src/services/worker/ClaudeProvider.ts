@@ -25,7 +25,10 @@ import {
 
 // @ts-ignore - Agent SDK types may not be available
 import { query } from '@anthropic-ai/claude-agent-sdk';
+import { buildHardenedSdkOptions } from '../../sdk/hardened-options.js';
 import { ClassifiedProviderError } from './provider-errors.js';
+import { resolveTierAlias } from './model-aliases.js';
+import { captureEvent } from '../telemetry/telemetry.js';
 
 /**
  * Module-scoped guard so the "effort parameter" hint only fires once per
@@ -134,6 +137,19 @@ export function classifyClaudeError(err: unknown): ClassifiedProviderError {
     );
   }
 
+  // Status-less Anthropic 400s — SDK wrapping can drop `.status`, leaving only
+  // the message or an `invalid_request_error` body; classify those as
+  // unrecoverable so the worker stops retrying a permanent config error (#2656).
+  // The status guard keeps statused 4xx/5xx on their own branches.
+  if (
+    typeof errAny.status !== 'number' &&
+    (errAny.error?.type === 'invalid_request_error' ||
+      /\bthe provided model identifier is invalid\b/i.test(message) ||
+      /\binvalid_request_error\b/i.test(message))
+  ) {
+    return new ClassifiedProviderError(message, { kind: 'unrecoverable', cause: err });
+  }
+
   // Server errors → transient.
   if (typeof errAny.status === 'number' && errAny.status >= 500 && errAny.status < 600) {
     return new ClassifiedProviderError(message, { kind: 'transient', cause: err });
@@ -166,20 +182,10 @@ export class ClaudeProvider {
     const claudePath = findClaudeExecutable('SDK');
 
     const modelId = session.modelOverride || this.getModelId();
-    const disallowedTools = [
-      'Bash',           // Prevent infinite loops
-      'Read',           // No file reading
-      'Write',          // No file writing
-      'Edit',           // No file editing
-      'Grep',           // No code searching
-      'Glob',           // No file pattern matching
-      'WebFetch',       // No web fetching
-      'WebSearch',      // No web searching
-      'Task',           // No spawning sub-agents
-      'NotebookEdit',   // No notebook editing
-      'AskUserQuestion',// No asking questions
-      'TodoWrite'       
-    ];
+    session.lastModelId = typeof modelId === 'string' ? modelId : undefined;
+    // Each query() starts a fresh SDK process, so its total_cost_usd
+    // accumulator starts from zero — reset the per-turn cost baseline with it.
+    session.lastResultTotalCostUsd = null;
 
     const messageGenerator = this.createMessageGenerator(session, cwdTracker);
 
@@ -225,19 +231,18 @@ export class ClaudeProvider {
     ensureDir(OBSERVER_SESSIONS_DIR);
     const queryResult = query({
       prompt: messageGenerator,
-      options: {
+      options: buildHardenedSdkOptions({
+        source: 'Observer',
+        sessionDbId: session.sessionDbId,
+        contentSessionId: session.contentSessionId,
+        project: session.project,
         model: modelId,
-        cwd: OBSERVER_SESSIONS_DIR,
-        ...(shouldResume && session.memorySessionId ? { resume: session.memorySessionId } : {}),
-        disallowedTools,
-        abortController: session.abortController,
-        pathToClaudeCodeExecutable: claudePath,
-        spawnClaudeCodeProcess: createSdkSpawnFactory(session.sessionDbId),
         env: isolatedEnv,  // Use isolated credentials from ~/.claude-mem/.env, not process.env
-        mcpServers: {},
-        settingSources: [],
-        strictMcpConfig: true,
-      }
+        pathToClaudeCodeExecutable: claudePath,
+        abortController: session.abortController,
+        ...(shouldResume && session.memorySessionId ? { resume: session.memorySessionId } : {}),
+        spawnClaudeCodeProcess: createSdkSpawnFactory(session.sessionDbId),
+      }),
     });
 
     try {
@@ -325,6 +330,15 @@ export class ClaudeProvider {
               session.cumulativeInputTokens += usage.cache_creation_input_tokens;
             }
 
+            // Real per-response usage for telemetry (tokens_input includes the
+            // full context the model read: fresh + cache writes + cache reads).
+            session.lastUsage = {
+              input: (usage.input_tokens || 0) +
+                (usage.cache_creation_input_tokens || 0) +
+                (usage.cache_read_input_tokens || 0),
+              output: usage.output_tokens || 0,
+            };
+
             logger.debug('SDK', 'Token usage captured', {
               sessionId: session.sessionDbId,
               inputTokens: usage.input_tokens,
@@ -376,11 +390,59 @@ export class ClaudeProvider {
           );
         }
 
-        if (message.type === 'result' && message.subtype === 'success') {
-          // Usage telemetry is captured at SDK level
+        if (message.type === 'result') {
+          // The result message carries the turn's finalized usage (per-turn,
+          // not cumulative — verified empirically against the SDK) plus a
+          // CUMULATIVE total_cost_usd; per-compression cost is the delta
+          // between consecutive results. The assistant message's
+          // usage.output_tokens is an early-streaming placeholder and must
+          // never feed telemetry.
+          const resultUsage = (message as any).usage as {
+            input_tokens?: number;
+            cache_creation_input_tokens?: number;
+            cache_read_input_tokens?: number;
+            output_tokens?: number;
+          } | undefined;
+          const totalCostUsd = (message as any).total_cost_usd as number | undefined;
+          let turnCostUsd: number | undefined;
+          if (typeof totalCostUsd === 'number') {
+            const prior = session.lastResultTotalCostUsd ?? 0;
+            // A total below the prior baseline means the SDK session restarted
+            // and its accumulator reset — the new total IS the turn's cost.
+            turnCostUsd = totalCostUsd >= prior ? totalCostUsd - prior : totalCostUsd;
+            session.lastResultTotalCostUsd = totalCostUsd;
+          }
+
+          const pending = session.pendingCompressionEvent;
+          if (pending) {
+            session.pendingCompressionEvent = null;
+            const finalInput = resultUsage
+              ? (resultUsage.input_tokens || 0) +
+                (resultUsage.cache_creation_input_tokens || 0) +
+                (resultUsage.cache_read_input_tokens || 0)
+              : undefined;
+            const finalOutput = resultUsage ? resultUsage.output_tokens || 0 : undefined;
+            captureEvent('session_compressed', {
+              ...pending,
+              tokens_input: finalInput,
+              tokens_output: finalOutput,
+              cost_usd: turnCostUsd,
+              compression_ratio:
+                finalInput && finalOutput
+                  ? Math.round((finalInput / finalOutput) * 100) / 100
+                  : undefined,
+            });
+          }
         }
       }
     } finally {
+      // A stashed compression event whose turn never reached a result message
+      // (abort/kill) still ships — without token fields, per the no-estimates
+      // rule — instead of being silently dropped.
+      if (session.pendingCompressionEvent) {
+        captureEvent('session_compressed', session.pendingCompressionEvent);
+        session.pendingCompressionEvent = null;
+      }
       const tracked = getSdkProcessForSession(session.sessionDbId);
       if (tracked && tracked.process.exitCode === null) {
         await ensureSdkProcessExit(tracked, 5000);
@@ -415,6 +477,8 @@ export class ClaudeProvider {
 
     session.conversationHistory.push({ role: 'user', content: initPrompt });
 
+    session.lastPromptSentAt = Date.now();
+    session.lastGeneratorSource = 'init';
     yield {
       type: 'user',
       message: {
@@ -450,6 +514,8 @@ export class ClaudeProvider {
 
         session.conversationHistory.push({ role: 'user', content: obsPrompt });
 
+        session.lastPromptSentAt = Date.now();
+        session.lastGeneratorSource = 'ingest';
         yield {
           type: 'user',
           message: {
@@ -471,6 +537,8 @@ export class ClaudeProvider {
 
         session.conversationHistory.push({ role: 'user', content: summaryPrompt });
 
+        session.lastPromptSentAt = Date.now();
+        session.lastGeneratorSource = 'summarize';
         yield {
           type: 'user',
           message: {
@@ -488,6 +556,7 @@ export class ClaudeProvider {
   private getModelId(): string {
     const settingsPath = paths.settings();
     const settings = SettingsDefaultsManager.loadFromFile(settingsPath);
-    return settings.CLAUDE_MEM_MODEL;
+    // Resolve $TIER:<fast|smart|simple|summary> aliases at request time (#2289).
+    return resolveTierAlias(settings.CLAUDE_MEM_MODEL, settings);
   }
 }

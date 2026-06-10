@@ -168,7 +168,7 @@ export function loadUserGrammars(projectRoot: string): UserGrammarConfig {
         QUERIES[queryKey] = queryContent;
         config.languageToQueryKey[language] = queryKey;
       } catch {
-        console.error(`[smart-file-read] Custom query file not found: ${fullQueryPath}, falling back to generic`);
+        logger.warn('PARSER', 'Custom query file not found, falling back to generic', { fullQueryPath });
         config.languageToQueryKey[language] = "generic";
       }
     } else {
@@ -256,7 +256,7 @@ export function resolveGrammarPathWithFallback(language: string, projectRoot?: s
     // Grammar package not installed
   }
 
-  console.error(`[smart-file-read] Grammar package not found for "${language}": ${entry.package} (install it in your project's node_modules)`);
+  logger.warn('PARSER', 'Grammar package not found', { language, package: entry.package });
   return null;
 }
 
@@ -269,6 +269,19 @@ const QUERIES: Record<string, string> = {
 (interface_declaration name: (type_identifier) @name) @iface
 (type_alias_declaration name: (type_identifier) @name) @tdef
 (enum_declaration name: (identifier) @name) @enm
+(import_statement) @imp
+(export_statement) @exp
+`,
+
+  // Plain JavaScript: the tree-sitter-javascript grammar has no type_identifier,
+  // interface_declaration, type_alias_declaration or enum_declaration nodes, so it
+  // cannot share the jsts query — tree-sitter aborts query compilation on the first
+  // unknown node type. Class names are (identifier) here, not (type_identifier).
+  js: `
+(function_declaration name: (identifier) @name) @func
+(lexical_declaration (variable_declarator name: (identifier) @name value: [(arrow_function) (function_expression)])) @const_func
+(class_declaration name: (identifier) @name) @cls
+(method_definition name: (property_identifier) @name) @method
 (import_statement) @imp
 (export_statement) @exp
 `,
@@ -422,6 +435,7 @@ const QUERIES: Record<string, string> = {
 function getQueryKey(language: string): string {
   switch (language) {
     case "javascript":
+      return "js";
     case "typescript":
     case "tsx":
       return "jsts";
@@ -760,6 +774,16 @@ function buildSymbols(matches: RawMatch[], lines: string[], language: string): {
   return { symbols: symbols.filter(s => !nested.has(s)), imports };
 }
 
+export function findProjectRoot(filePath: string): string | undefined {
+  let dir = dirname(filePath);
+  while (true) {
+    if (existsSync(join(dir, ".claude-mem.json"))) return dir;
+    const parent = dirname(dir);
+    if (parent === dir) return undefined;
+    dir = parent;
+  }
+}
+
 export function parseFile(content: string, filePath: string, projectRoot?: string): FoldedFile {
   const userConfig = projectRoot ? loadUserGrammars(projectRoot) : EMPTY_USER_GRAMMAR_CONFIG;
   const language = detectLanguageWithUserGrammars(filePath, userConfig);
@@ -983,8 +1007,8 @@ function getSymbolIcon(kind: CodeSymbol["kind"]): string {
   return icons[kind] || "·";
 }
 
-export function unfoldSymbol(content: string, filePath: string, symbolName: string): string | null {
-  const file = parseFile(content, filePath);
+export function unfoldSymbol(content: string, filePath: string, symbolName: string, projectRoot?: string): string | null {
+  const file = parseFile(content, filePath, projectRoot);
 
   const findSymbol = (symbols: CodeSymbol[]): CodeSymbol | null => {
     for (const sym of symbols) {

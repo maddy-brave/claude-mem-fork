@@ -14,7 +14,8 @@ bring the fork forward without re-introducing already-fixed bugs.
   pointer for the Mac workstation. Historically the Mac branch carried an extra
   `bash -c` hook wrap; that wrap is no longer needed (see below), so the branches have
   converged.
-- `v13.5.5-fork.1` — annotated tag at the merge commit (the released fork build).
+- `v13.5.5-fork.1` — annotated tag at the merge commit (the first released fork build).
+- `v13.5.5-fork.2` — dependency-maintenance release on `stable-v13.5.5`: `@anthropic-ai/claude-agent-sdk` `^0.2.138` -> `^0.3.172` (resolved 0.3.172). No source changes beyond the version pin + provenance comment; worker bundle rebuilt. See "Dependency maintenance" below.
 - Older: `stable` (base v13.3.0), `mac-sh-hook-wrapper-2026-05-28` (v13.3.0 + the old
   Mac wrap), tag `v13.3.1-fork.2`, and `rollback/2026-06-11-pre-v13.5.5-rebase`
   (pre-rebase rollback point). Do not delete; they are the rollback record.
@@ -40,6 +41,35 @@ cache key changes and Claude Code lands fresh content in a new cache dir.
 
 Fork-only files that must survive every rebase: `src/shared/spawn-lock.ts`,
 `src/shared/env-bootstrap.ts`.
+
+## Dependency maintenance
+
+Every fork release keeps installed dependencies current with latest in-range security and
+bug-fix versions, not just enough to make the build resolve (the `npm install --no-audit`
+build step is build-correctness only). On each release: `npm outdated`, pull in-range
+patch/minor updates, `npm audit` (apply fixes in-range only, never `--force`), re-verify the
+security-sensitive set (express, better-auth, dompurify, bullmq, ioredis, pg, shell-quote,
+@modelcontextprotocol/sdk), then `npm run build` so the new versions are bundled into
+`worker-service.cjs` (a source bump that is not rebuilt never reaches the runtime).
+
+**v13.5.5-fork.2 (2026-06-11) — Agent SDK 0.2.141 -> 0.3.172.** Previously deferred as a
+breaking-minor decision; executed as an isolated dependency-maintenance release.
+- The SDK consumer surface is `query()` + a hardened `Options` object + the `SDKUserMessage`
+  / `SDK* ` types (`src/sdk/hardened-options.ts`, `src/services/worker/ClaudeProvider.ts`,
+  `src/services/worker/knowledge/KnowledgeAgent.ts`, `worker-types.ts`, `RateLimitStore.ts`).
+- 0.3 breaking changes assessed against that surface and found non-impacting: the
+  `unstable_v2_*` session API is unused (`query()` only); `options.env` replace-vs-overlay
+  (landed 0.2.113) is already the intended behaviour here (`env: isolatedEnv`, deliberately
+  NOT `process.env`); `mcpServers:{}` is empty so the 0.3.142 background-MCP-connect change is
+  moot; no `TodoWrite` tool-event parsing; `RateLimitStore` consumes the `{subtype:'rate_limit'}`
+  info event, not the `api_retry.error` 529 string that changed to `'overloaded'` in 0.3.150.
+- Peer-dep move (0.3.143: `@anthropic-ai/sdk` + `@modelcontextprotocol/sdk` -> peerDependencies)
+  is transparent: the SDK self-bundles them, esbuild resolves cleanly, `@modelcontextprotocol/sdk`
+  is already a direct dep. `@anthropic-ai/sdk` is intentionally absent from node_modules.
+- Validation: `npm run build` clean (bundle 2444 KB, within budget), `tsc --noEmit` 0 errors,
+  worker `--version` boot exit 0, fork features present in the rebuilt bundle (port-walk
+  EADDRINUSE, spawn-lock, CLAUDE_MEM_DATA_DIR). Runtime `query()` validation (observation
+  generation) happens post-deploy.
 
 ## Telemetry / privacy (corporate deployment)
 

@@ -29,8 +29,9 @@
  *                  filesystem escape hatches.
  *
  * The redundancy IS the security property: removing any one layer must not
- * re-open the gap. Verified against @anthropic-ai/claude-agent-sdk v0.2.141
- * (sdk.d.ts): `tools`, `allowedTools`, `disallowedTools`, `permissionMode`
+ * re-open the gap. Verified against @anthropic-ai/claude-agent-sdk v0.3.172
+ * (sdk.d.ts; re-verified at the 0.2.141 -> 0.3.172 bump 2026-06-11 — these
+ * fields are unchanged across the 0.3 line): `tools`, `allowedTools`, `disallowedTools`, `permissionMode`
  * ('dontAsk' = "Don't prompt for permissions, deny if not pre-approved"),
  * `canUseTool` (returns PermissionResult { behavior: 'deny', message }),
  * `additionalDirectories`, `mcpServers`, `settingSources`, `strictMcpConfig`

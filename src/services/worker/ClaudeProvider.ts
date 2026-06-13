@@ -6,6 +6,7 @@ import { buildInitPrompt, buildObservationPrompt, buildSummaryPrompt, buildConti
 import { SettingsDefaultsManager } from '../../shared/SettingsDefaultsManager.js';
 import { USER_SETTINGS_PATH, OBSERVER_SESSIONS_DIR, ensureDir, paths } from '../../shared/paths.js';
 import { buildIsolatedEnvWithFreshOAuth, getAuthMethodDescription } from '../../shared/EnvManager.js';
+import { writeStaleMarker } from '../../shared/oauth-token.js';
 import { findClaudeExecutable } from '../../shared/find-claude-executable.js';
 import type { ActiveSession, SDKUserMessage } from '../worker-types.js';
 import { ModeManager } from '../domain/ModeManager.js';
@@ -435,6 +436,21 @@ export class ClaudeProvider {
           }
         }
       }
+    } catch (err) {
+      // Runtime auth failure (HTTP 401/403): the OAuth token (keychain or the
+      // file-fallback ~/.claude-mem/oauth-token.txt) is invalid or expired.
+      // Write the stale marker so the SessionStart context hook surfaces a
+      // loud, actionable warning. Re-throw so upstream classification/retry is
+      // unchanged.
+      if (classifyClaudeError(err).kind === 'auth_invalid') {
+        writeStaleMarker(
+          'claude-mem summarization auth failed at runtime (HTTP 401/403). The ' +
+          'OAuth token is invalid or expired. Refresh it: run `claude setup-token` ' +
+          'and write the value to ~/.claude-mem/oauth-token.txt (file-fallback), ' +
+          'or re-login via Claude Desktop if you use the keychain.'
+        );
+      }
+      throw err;
     } finally {
       // A stashed compression event whose turn never reached a result message
       // (abort/kill) still ships — without token fields, per the no-estimates

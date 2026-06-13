@@ -28,7 +28,7 @@ const READ_TIMEOUT_MS = 5000;
 const EXPIRY_GRACE_MS = 60_000;
 
 export type OAuthTokenResult =
-  | { kind: 'present'; token: string; source: 'keychain' | 'env-fallback'; expiresAt?: number }
+  | { kind: 'present'; token: string; source: 'keychain' | 'env-fallback' | 'file-fallback'; expiresAt?: number }
   | { kind: 'expired'; reason: string; expiresAt?: number }
   | { kind: 'absent'; reason: string };
 
@@ -262,6 +262,28 @@ function readSidecarExpiresAt(): number | undefined {
 }
 
 /**
+ * File-based long-lived token for headless / Claude-Code-only machines where
+ * Claude Desktop never writes the platform keychain. The operator drops a
+ * `claude setup-token` value (opaque sk-ant-oat*, ~1yr, no embedded expiry) at
+ * ${DATA_DIR}/oauth-token.txt, overridable via CLAUDE_MEM_OAUTH_TOKEN_FILE.
+ * Staleness is surfaced REACTIVELY (a 401/403 at summarization time writes the
+ * stale marker via ClaudeProvider) rather than preemptively here, because the
+ * token carries no decodable expiry.
+ */
+const OAUTH_TOKEN_FILE_NAME = 'oauth-token.txt';
+function readFileFallbackToken(): string | undefined {
+  const tokenPath = process.env.CLAUDE_MEM_OAUTH_TOKEN_FILE
+    ?? join(paths.dataDir(), OAUTH_TOKEN_FILE_NAME);
+  if (!existsSync(tokenPath)) return undefined;
+  try {
+    const raw = readFileSync(tokenPath, 'utf-8').trim();
+    return raw.length > 0 ? raw : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * Read Claude Desktop's OAuth token, preferring the platform-native credential
  * store. Falls back to the CLAUDE_CODE_OAUTH_TOKEN environment variable only
  * when the keychain has no entry — env-as-primary is intended for CI/headless
@@ -316,6 +338,15 @@ export async function readClaudeOAuthToken(): Promise<OAuthTokenResult> {
       source: 'env-fallback',
       expiresAt: effectiveExpiresAt,
     };
+  }
+
+  // File-based long-lived token (headless / Claude-Code-only machines). Tried
+  // after keychain + env. No preemptive expiry check: setup-token values are
+  // opaque (no JWT exp); staleness is caught at runtime as a 401/403 (see
+  // ClaudeProvider) which writes the stale marker.
+  const fileToken = readFileFallbackToken();
+  if (fileToken) {
+    return { kind: 'present', token: fileToken, source: 'file-fallback' };
   }
 
   return keychainResult;

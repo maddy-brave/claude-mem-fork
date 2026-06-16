@@ -16,6 +16,7 @@ import { userInfo } from 'os';
 import { join } from 'path';
 import { paths } from './paths.js';
 import { logger } from '../utils/logger.js';
+import { oauthTokenPool } from './oauth-token-pool.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -28,7 +29,7 @@ const READ_TIMEOUT_MS = 5000;
 const EXPIRY_GRACE_MS = 60_000;
 
 export type OAuthTokenResult =
-  | { kind: 'present'; token: string; source: 'keychain' | 'env-fallback'; expiresAt?: number }
+  | { kind: 'present'; token: string; source: 'keychain' | 'env-fallback' | 'file-fallback'; expiresAt?: number; poolId?: string }
   | { kind: 'expired'; reason: string; expiresAt?: number }
   | { kind: 'absent'; reason: string };
 
@@ -262,6 +263,20 @@ function readSidecarExpiresAt(): number | undefined {
 }
 
 /**
+ * Multi-subscription token pool for headless / Claude-Code-only machines.
+ * Reads ${DATA_DIR}/.oauth_tokens (one token per line; labels, comments,
+ * and de-duplication handled by OAuthTokenPool). The pool selects the first
+ * healthy (non-cooling) token; on a 401/429/quota failure ClaudeProvider calls
+ * pool.markCooldown() and the next request auto-rotates to the next healthy
+ * token. Staleness is surfaced REACTIVELY (a runtime 401/403 writes the stale
+ * marker) — no preemptive expiry check because setup-token values are opaque.
+ *
+ * Single-token legacy: operators who wrote oauth-token.txt may migrate by
+ * moving that value into .oauth_tokens. The old single-file path is removed
+ * in this revision; the pool file is the sole file-fallback mechanism.
+ */
+
+/**
  * Read Claude Desktop's OAuth token, preferring the platform-native credential
  * store. Falls back to the CLAUDE_CODE_OAUTH_TOKEN environment variable only
  * when the keychain has no entry — env-as-primary is intended for CI/headless
@@ -316,6 +331,18 @@ export async function readClaudeOAuthToken(): Promise<OAuthTokenResult> {
       source: 'env-fallback',
       expiresAt: effectiveExpiresAt,
     };
+  }
+
+  // Token pool (headless / Claude-Code-only machines). Tried after keychain +
+  // env. selectToken() returns the first non-cooling entry; if all are cooling
+  // it returns the soonest-expiring one (still attempt — better than hard-fail).
+  // No preemptive expiry check: setup-token values are opaque (no JWT exp);
+  // staleness is caught reactively at runtime as a 401/403 (ClaudeProvider
+  // calls pool.markCooldown() and the stale marker fires only on whole-pool
+  // exhaustion).
+  const sel = oauthTokenPool.selectToken();
+  if (sel) {
+    return { kind: 'present', token: sel.token, source: 'file-fallback', poolId: sel.id };
   }
 
   return keychainResult;

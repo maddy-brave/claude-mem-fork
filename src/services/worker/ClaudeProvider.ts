@@ -6,6 +6,8 @@ import { buildInitPrompt, buildObservationPrompt, buildSummaryPrompt, buildConti
 import { SettingsDefaultsManager } from '../../shared/SettingsDefaultsManager.js';
 import { USER_SETTINGS_PATH, OBSERVER_SESSIONS_DIR, ensureDir, paths } from '../../shared/paths.js';
 import { buildIsolatedEnvWithFreshOAuth, getAuthMethodDescription } from '../../shared/EnvManager.js';
+import { writeStaleMarker } from '../../shared/oauth-token.js';
+import { oauthTokenPool, type CooldownKind } from '../../shared/oauth-token-pool.js';
 import { findClaudeExecutable } from '../../shared/find-claude-executable.js';
 import type { ActiveSession, SDKUserMessage } from '../worker-types.js';
 import { ModeManager } from '../domain/ModeManager.js';
@@ -435,6 +437,79 @@ export class ClaudeProvider {
           }
         }
       }
+    } catch (err) {
+      // Pool-aware failure handler (next-call rotation variant).
+      //
+      // SAFETY: in-call retry was ruled out because by the time catch fires the
+      // for-await iterator is consumed and session.memorySessionId may have been
+      // partially updated mid-stream. Restoring that state to retry safely would
+      // require snapshotting session fields before the query() call, adding
+      // non-trivial risk. The next-call variant is self-correcting with zero
+      // session-state risk: markCooldown() here causes selectToken() to skip
+      // this token on the next summarize request, achieving the same resilience
+      // goal without restarting an in-flight query.
+      //
+      // Pool path (source === 'file-fallback'):
+      //   On rate_limit / quota_exhausted / auth_invalid — mark the active pool
+      //   token on cooldown so the next call auto-rotates to a healthy one.
+      //   Write the stale marker only when the whole pool is exhausted (all
+      //   tokens cooling) — that is the genuine "no path forward" signal.
+      //
+      // Keychain / env single-token path:
+      //   auth_invalid => write stale marker immediately (original behaviour).
+      //   No pool to rotate to.
+      const classified = classifyClaudeError(err);
+      const kind = classified.kind;
+      const rotatable: boolean =
+        kind === 'rate_limit' || kind === 'quota_exhausted' || kind === 'auth_invalid';
+
+      // Best-effort retry-after extraction from the error object.
+      const retryAfterMs: number | undefined = (() => {
+        const errAny = err as { headers?: Record<string, string>; retryAfter?: number; retry_after?: number };
+        if (typeof errAny.retryAfter === 'number') return errAny.retryAfter * 1000;
+        if (typeof errAny.retry_after === 'number') return errAny.retry_after * 1000;
+        const headerVal = errAny.headers?.['retry-after'];
+        if (headerVal) {
+          const parsed = parseInt(headerVal, 10);
+          if (!isNaN(parsed)) return parsed * 1000;
+        }
+        return undefined;
+      })();
+
+      if (rotatable && oauthTokenPool.size > 0 && oauthTokenPool.lastSelectedId) {
+        // Pool path: mark the token that just failed.
+        oauthTokenPool.markCooldown(
+          oauthTokenPool.lastSelectedId,
+          kind as CooldownKind,
+          retryAfterMs,
+        );
+        logger.info('OAUTH', `Pool token marked cooling; pool exhausted=${oauthTokenPool.allExhausted()}`, {
+          failedId: oauthTokenPool.lastSelectedId,
+          kind,
+          sessionDbId: session.sessionDbId,
+        });
+
+        if (oauthTokenPool.allExhausted()) {
+          // Whole pool is capped/exhausted — surface loud marker.
+          writeStaleMarker(
+            'All claude-mem subscription tokens are capped or expired. ' +
+            'Run `claude setup-token` for each subscription and add the values ' +
+            'to ~/.claude-mem/.oauth_tokens, then restart the worker.'
+          );
+        }
+        // Whether or not the pool is exhausted, re-throw so upstream
+        // classification/retry is unchanged. The next call will selectToken()
+        // fresh — it either gets a healthy token or the soonest-expiring one.
+      } else if (kind === 'auth_invalid') {
+        // Keychain / env single-token path: immediate stale marker.
+        writeStaleMarker(
+          'claude-mem summarization auth failed at runtime (HTTP 401/403). The ' +
+          'OAuth token is invalid or expired. Refresh it: run `claude setup-token` ' +
+          'and add the value to ~/.claude-mem/.oauth_tokens (pool file), ' +
+          'or re-login via Claude Desktop if you use the keychain.'
+        );
+      }
+      throw err;
     } finally {
       // A stashed compression event whose turn never reached a result message
       // (abort/kill) still ships — without token fields, per the no-estimates

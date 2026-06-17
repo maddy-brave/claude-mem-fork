@@ -8,14 +8,20 @@ bring the fork forward without re-introducing already-fixed bugs.
 
 ## Branch + tag layout
 
-- `stable-v13.5.5` — current canonical branch. Base: upstream **v13.5.5**. Merge-based
-  history (see "Rebase procedure"). Mac- and Windows-compatible.
+- `stable-v13.6.1` — **current canonical branch + fork default branch.** Base: upstream
+  **v13.6.1**, merged on top of the prior `stable-v13.5.5` line (which was at
+  `v13.5.5-fork.3`). Merge-based history (see "Rebase procedure"). Mac- and
+  Windows-compatible.
+- `stable-v13.5.5` — prior canonical branch (base v13.5.5, last released `v13.5.5-fork.3`).
+  Kept as the rollback record; do not delete.
 - `mac-v13.5.5` — identical to `stable-v13.5.5` (zero divergence). Kept as a named
   pointer for the Mac workstation. Historically the Mac branch carried an extra
   `bash -c` hook wrap; that wrap is no longer needed (see below), so the branches have
   converged.
 - `v13.5.5-fork.1` — annotated tag at the merge commit (the first released fork build).
 - `v13.5.5-fork.2` — dependency-maintenance release on `stable-v13.5.5`: `@anthropic-ai/claude-agent-sdk` `^0.2.138` -> `^0.3.172` (resolved 0.3.172). No source changes beyond the version pin + provenance comment; worker bundle rebuilt. See "Dependency maintenance" below.
+- `v13.5.5-fork.3` — file-based OAuth token POOL (`src/shared/oauth-token-pool.ts`, `oauth-token.ts`, `ClaudeProvider.ts`) for Claude-Code-only machines (keychain absent). Rides along on `stable-v13.6.1`; inert on Windows (keychain present).
+- `v13.6.1-fork.1` — annotated tag at the v13.6.1 merge commit. Base upstream **v13.6.1**; carries all fork.1–fork.3 patches minus `spawn-lock.ts` (dropped → upstream `worker-spawn-gate.ts`). Rollback tag `rollback/2026-06-17-pre-v13.6.1-rebase`.
 - Older: `stable` (base v13.3.0), `mac-sh-hook-wrapper-2026-05-28` (v13.3.0 + the old
   Mac wrap), tag `v13.3.1-fork.2`, and `rollback/2026-06-11-pre-v13.5.5-rebase`
   (pre-rebase rollback point). Do not delete; they are the rollback record.
@@ -23,12 +29,12 @@ bring the fork forward without re-introducing already-fixed bugs.
 Fork version string is bumped to `<upstream>-fork.N` on every rebase so the plugin
 cache key changes and Claude Code lands fresh content in a new cache dir.
 
-## Patch inventory (status at v13.5.5)
+## Patch inventory (status at v13.6.1)
 
 | Area | Origin | Platform | Status at v13.5.5 |
 |---|---|---|---|
 | Worker port-walk on EADDRINUSE + kernel bind probe + pidfile-authoritative `getWorkerPort` | `src/services/worker-service.ts`, `worker-spawner.ts`, `src/shared/worker-utils.ts`, `HealthMonitor.ts` | cross (Windows phantom-listener primary) | **KEEP** — no upstream equivalent. Upstream `isPortInUse` still HTTP-probes; it exits cleanly on EADDRINUSE but does not walk. |
-| Spawn-lock around lazy-spawn | `src/shared/spawn-lock.ts` (fork-only file), integrated in `worker-utils.ts` | cross | **KEEP** — no upstream equivalent. |
+| Spawn-lock around lazy-spawn | was `src/shared/spawn-lock.ts` (fork-only) | cross | **DROPPED → upstreamed (v13.6.1).** Upstream v13.5.6 ships `src/shared/worker-spawn-gate.ts` (`acquireSpawnLock(): boolean` + `releaseSpawnLock()`, `wx`-flag `<DATA_DIR>/spawn.lock`, 60s staleness, owner-checked release) — a strict superset. `spawn-lock.ts` deleted; `worker-utils.ts`/`worker-spawner.ts` switched to the gate API (boolean + try/finally `releaseSpawnLock`). No stale build-verify guard referenced it (Gotcha 8 clear). |
 | HKCU env bootstrap when the launcher env block is empty | `src/shared/env-bootstrap.ts` (fork-only file), `SettingsDefaultsManager.ts`, `ProcessManager.ts` | Windows | **KEEP** — no upstream equivalent. |
 | `sync-marketplace` uses `fs.cpSync` instead of `rsync` | `scripts/sync-marketplace.cjs` | Windows | **KEEP** — upstream still uses rsync. Subsumes the old bun-install-cwd fix. |
 | `tree-sitter.exe` resolution | `src/services/smart-file-read/parser.ts` | Windows | **KEEP** — upstream `getTreeSitterBin()` falls back to bare `tree-sitter` with no `.exe`. Re-apply onto the rewritten parser after each rebase. |
@@ -40,8 +46,10 @@ cache key changes and Claude Code lands fresh content in a new cache dir.
 | EACCES/EPIPE drain-all hook guard | `plugin/hooks/hooks.json` | cross | **DROPPED → upstreamed** verbatim. |
 | Windows `bun.exe` direct-spawn (no `cmd.exe` shell) | `plugin/scripts/bun-runner.js` | Windows | **KEEP** — no upstream equivalent. Upstream resolves `bun.cmd` and spawns it with `shell:true`, so the chain is `node -> cmd.exe -> bun.exe`; with `windowsHide:true` the `cmd.exe` is hidden but it launches `bun.exe` WITHOUT propagating `CREATE_NO_WINDOW`, so the `bun.exe` grandchild gets a fresh **visible** console — one flash per capture-hook firing (`observation`/`file-context`/`summarize`) on Windows, i.e. effectively per tool use. The patch makes `findBun()` prefer `~/.bun/bin/bun.exe` and spawns it DIRECTLY (no shell) so `windowsHide:true` (`CREATE_NO_WINDOW`) actually suppresses the window; the `shell:true` path is retained only as a fallback for when no real `bun.exe` is resolvable (a `bun.cmd` shim cannot be spawned without a shell). bun-runner.js is copied verbatim (not bundled), so this takes effect on a plain marketplace sync with no rebuild. Re-apply onto any rewritten bun-runner after a rebase. Origin: 2026-06-16 spawn-flash durable fix, complements the external pyw windowless shim (`claude-mem-hook-windowless.py`) that handles the node-level console. |
 
-Fork-only files that must survive every rebase: `src/shared/spawn-lock.ts`,
-`src/shared/env-bootstrap.ts`.
+Fork-only files that must survive every rebase: `src/shared/env-bootstrap.ts`,
+`src/shared/oauth-token-pool.ts` (fork.3 OAuth pool). NOTE: `src/shared/spawn-lock.ts`
+was a fork-only file but was DROPPED at v13.6.1 — superseded by upstream
+`src/shared/worker-spawn-gate.ts`. Do NOT reintroduce it.
 
 ## Dependency maintenance
 
@@ -71,6 +79,21 @@ breaking-minor decision; executed as an isolated dependency-maintenance release.
   worker `--version` boot exit 0, fork features present in the rebuilt bundle (port-walk
   EADDRINUSE, spawn-lock, CLAUDE_MEM_DATA_DIR). Runtime `query()` validation (observation
   generation) happens post-deploy.
+
+**v13.6.1-fork.1 (2026-06-17) — upstream v13.6.1 merge.** Merged upstream `v13.6.1` onto the
+prior `stable-v13.5.5` line (`v13.5.5-fork.3`) → new `stable-v13.6.1` branch. Conflict surface:
+2 source (`worker-utils.ts`, `worker-spawner.ts`), root `package.json`, `scripts/sync-marketplace.cjs`,
+6 manifests, 5 build-artifact `.cjs` (took upstream, rebuilt). KEEP-pidfile (Option A) re-derived:
+fork's pidfile-authoritative spawn/discovery (`waitForPidfilePort` + `boundPort` + `clearPortCache`
++ `CLAUDE_MEM_WORKER_PORT` spawn env) adapted onto upstream's new `worker-spawn-gate` API; pidfile-first
+`getWorkerPort` auto-merged intact; did NOT adopt upstream's settings.json `getWorkerPort` move.
+`resolveBunRuntime` dropped → upstream `resolveWorkerRuntimePath` (strict superset). `spawn-lock.ts`
+dropped (see table). Dep bumps from upstream: `better-auth`/`@better-auth/api-key` `^1.6.16`,
+`dompurify ^3.4.9`, `posthog-node ^5.36.15`; kept fork's higher `bullmq ^5.76.9`. Validation:
+`npm run build` clean (worker bundle ~2531 KB), `tsc --noEmit` 0 errors, `npm audit` 0 vulns,
+`npm outdated` empty (all latest-in-range), KEEP string-literals confirmed in rebuilt bundles
+(port-walk + phantom-listener + `spawn.lock` + `.oauth_tokens` + `reg query` in `worker-service.cjs`,
+`tree-sitter.exe` in `mcp-server.cjs`). Runtime validation post-deploy.
 
 ## Telemetry / privacy (corporate deployment)
 

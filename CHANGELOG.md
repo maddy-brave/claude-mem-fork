@@ -4,6 +4,92 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [13.6.0] - 2026-06-13
+
+## 📊 Historical Telemetry Backfill
+
+claude-mem's growth metrics now extend back before telemetry existed. On the first worker start after this upgrade, each install performs a **one-time backfill** of anonymized daily activity rollups into PostHog via historical-migration ingestion — so installs-over-time, reconstructed WAU/MAU, and cohort retention reflect real usage history instead of starting at the telemetry ship date.
+
+### What gets sent
+**Anonymous counts only — never titles, prompts, file contents, or project names:**
+- One profile-less `historical_activity` event per active day: observation/session/summary/prompt counts, observation-type breakdown, session outcomes, platform buckets, subagent counts, and compression discovery-token totals — all tagged `backfilled: true`
+- One `install_inferred` event carrying the install's first active date, drawn from trustworthy session timestamps
+
+### Privacy & safety
+- Honors the exact same consent gates as live telemetry: `DO_NOT_TRACK`, `CLAUDE_MEM_TELEMETRY=0`, and `telemetry.json` opt-out. Opting out before your first post-upgrade worker start prevents the backfill entirely; a later opt-in still backfills.
+- Runs **once per install**, latched by a completion marker written only after confirmed delivery — failed sends retry on the next worker start, and deterministic event uuids make retries duplicate-safe.
+- `CLAUDE_MEM_TELEMETRY_DEBUG=1` dry-runs the full payload to stderr without sending anything.
+- Legacy epoch normalization and corrupt-row guards keep bad timestamps out of the historical record; partial days are never shipped.
+
+Full disclosure documented at [docs.claude-mem.ai/telemetry](https://docs.claude-mem.ai/telemetry).
+
+**PR**: #2912
+
+## [13.5.7] - 2026-06-13
+
+## What's Fixed
+
+### Stale Claude CLI can no longer silently kill every observation (#2911)
+
+If an abandoned npm-global `claude` binary sat earlier in PATH than your current install, every Observer spawn died instantly at flag parsing — worker healthy, zero observations, nothing in the logs. The resolver now:
+
+- **Probes every candidate for capability**, not just existence: each CLI is tested with `--permission-mode dontAsk --version`, the exact flags claude-mem passes on every agent spawn. Binaries that reject them (older than the 2.1.x line) are skipped up front with a clear warning.
+- **Prefers the newest capable version** — PATH order only breaks ties, so a stale binary can't shadow a current one.
+- **Fails loud, never silent**: an explicit `CLAUDE_CODE_PATH` that's too old throws with the version and the remedy; if every CLI found is too old, the error names each path and version.
+- **Self-heals on CLI updates**: successful resolutions are cached 15 minutes, failures are never cached — updating your CLI is picked up on the next observation without a worker restart.
+- **Keeps a 2KB stderr tail** from SDK children, included in exit warnings (and read on `close`, so it's never truncated) — a CLI dying at flag parsing now says why at default log level.
+
+### Build
+
+- Bundle-size budgets are now advisory warnings instead of hard build failures.
+
+## [13.5.6] - 2026-06-11
+
+## Worker restart: single source of truth (#2894)
+
+This release rearchitects worker lifecycle management to eliminate the restart races behind version-recycle ping-pong storms, EADDRINUSE failures, and "healthy worker reports as not running" lies.
+
+### Highlights
+
+- **Self-replacing worker** — on restart, the dying worker spawns its own successor the moment its port frees. Old and new workers never coexist, and nothing external races to spawn into the gap. Hooks wait for the successor and lazy-spawn only as a fallback, at most one recycle per hook event.
+- **Restarts prove themselves** — `worker-service restart` now polls `/api/health` until the pid changes AND the version matches the new build, prints `Worker restart verified (pid, version)`, and exits 1 on failure instead of reporting success over a dead or stale worker. The daemon's generic start-failure path also exits 1 now.
+- **One spawn gate** — a `wx`-flag lockfile (`spawn.lock`, 60s mtime staleness, owner-checked release) serializes every external spawn path: hook lazy-spawn, MCP server, and the CLI restart fallback. Lock losers wait for the winner's worker instead of colliding. The two divergent Bun resolvers are unified (closing the kill-then-can't-respawn path), and the MCP server now prefers the marketplace worker script over stale plugin-cache copies.
+- **PID file demoted to diagnostics** — liveness truth is the port + `/api/health`. Every PID-file deletion is owner-guarded, so a dying worker can never clobber its successor's file; `status` reports pid/version/uptime/workerPath from health alone and survives PID-file deletion.
+- **First-run fix** — settings bootstrap notices now go to stderr, never stdout: the very first hook invocation on a fresh install no longer emits corrupted JSON to the hook framework.
+- **Build chain hardened** — the dev sync-script's installed-version cache mirror (which wrote new code into old version dirs, manufacturing permanent version disagreement) and its duplicate HTTP restart trigger are deleted; `build-and-sync` restarts through one verified CLI path.
+- **Test hygiene** — the test suite can no longer touch the real `~/.claude-mem` (a preload tripwire isolates every run), ending sentinel-PID and corrupt-JSON pollution of production state.
+
+### Validation
+
+Triple-restart soak (3× consecutive verified restarts, zero duplicate/EADDRINUSE events), plus a live re-creation of the original stale-launcher bug under concurrent session crossfire: one recycle per stale instance, convergence in 16 seconds, zero ping-pong over an 8.5-minute watch. 2,247 tests pass.
+
+## [13.5.5] - 2026-06-10
+
+## Telemetry Reliability Signals (Plan 14)
+
+claude-mem instrumented success well — failure was invisible. This release adds the five highest-value missing reliability signals (#2874). Everything is closed-enum/count-only, whitelisted in the scrubber, and disclosed in both the [public docs](https://docs.claude-mem.ai/telemetry) and `claude-mem telemetry`.
+
+### Search retrieval quality (`search_performed`)
+- `result_count`, `search_strategy` (`chroma|fts|filter_only`), `chroma_available`, `fallback_reason` (`none|chroma_connection|chroma_error|chroma_not_initialized`)
+- Zero-result rate is now computable, and Chroma's silent degradation to FTS is visible.
+
+### Compression trust (`session_compressed`)
+- `fabrication_detected` / `fabricated_count` — commit-hash fabrication by the observer model, on every emit path
+- Respawn-gated invalid-output events: `invalid_output_class` (`xml|idle|prose|poisoned`), `consecutive_invalid_outputs`, `respawn_triggered`
+- `outcome: aborted` with `abort_reason` (`idle|shutdown|overflow|restart_guard|quota|poisoned|none`), emitted where all abort flows converge
+
+### Worker lifecycle
+- New `worker_stopped` event: `uptime_seconds`, `shutdown_reason` (`stop|restart|signal`)
+- Crash detection via clean-shutdown sentinel: `worker_started` now reports `previous_shutdown` (`crash|clean|unknown`) and `previous_uptime_seconds`
+- Memory health: integer `process_rss_mb` / `heap_used_mb` on lifecycle events and the heartbeat
+
+### Hook failures
+- New `hook_failed` event over the direct CLI transport (the worker being unreachable IS the failure being reported), threshold-gated on the fail-loud counter and awaited before process exit so events survive short-lived hook processes
+
+### Fixes
+- **CI**: the PostHog `disableGeoip` regression test was order-dependent and failed full-suite runs (CI on main had been red since v13.5.4). `posthog-node` is now mocked globally via a bun test preload — which also guarantees test runs can never construct a real PostHog client and flush fabricated events into production analytics.
+- Windows-managed shutdown IPC now forwards the restart reason for `shutdown_reason` fidelity.
+
 ## [13.5.4] - 2026-06-10
 
 ## Fixed

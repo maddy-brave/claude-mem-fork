@@ -302,10 +302,14 @@ export async function readClaudeOAuthToken(): Promise<OAuthTokenResult> {
       };
   }
 
-  // If keychain produced a present or expired result, that's authoritative.
-  // Expired wins over env-fallback: a known-stale keychain entry is a clearer
-  // signal than an env var of unknown freshness.
-  if (keychainResult.kind === 'present' || keychainResult.kind === 'expired') {
+  // A present (unexpired) keychain token is authoritative — the Claude Desktop
+  // primary path. An EXPIRED keychain entry no longer short-circuits here
+  // (Option A, 2026-06-21): on Claude-Code-only machines (no Claude Desktop) the
+  // keychain may hold a stale token while the file pool holds valid setup-token
+  // values, so we fall through to env-fallback and then the pool. The expired
+  // result is still surfaced at the end of this function if env + pool both fail,
+  // preserving the writeStaleMarker "re-login via Claude Desktop" signal.
+  if (keychainResult.kind === 'present') {
     return keychainResult;
   }
 

@@ -34,7 +34,7 @@ export interface PoolEntry {
 /** Cooldown kinds that drive rotation. */
 export type CooldownKind = 'rate_limit' | 'quota_exhausted' | 'auth_invalid';
 
-const DEFAULT_COOLDOWN_MS: Record<CooldownKind, number> = {
+export const DEFAULT_COOLDOWN_MS: Record<CooldownKind, number> = {
   rate_limit: 15 * 60_000,        // 15 min
   quota_exhausted: 60 * 60_000,   // 1 h
   auth_invalid: 6 * 60 * 60_000,  // 6 h (treat as likely-dead)

@@ -6,7 +6,7 @@ import { buildInitPrompt, buildObservationPrompt, buildSummaryPrompt, buildConti
 import { SettingsDefaultsManager } from '../../shared/SettingsDefaultsManager.js';
 import { USER_SETTINGS_PATH, OBSERVER_SESSIONS_DIR, ensureDir, paths } from '../../shared/paths.js';
 import { buildIsolatedEnvWithFreshOAuth, getAuthMethodDescription } from '../../shared/EnvManager.js';
-import { writeStaleMarker } from '../../shared/oauth-token.js';
+import { writeStaleMarker, markKeychainCooldown, getLastTokenSelection } from '../../shared/oauth-token.js';
 import { oauthTokenPool, type CooldownKind } from '../../shared/oauth-token-pool.js';
 import { findClaudeExecutable } from '../../shared/find-claude-executable.js';
 import type { ActiveSession, SDKUserMessage } from '../worker-types.js';
@@ -87,8 +87,21 @@ export function classifyClaudeError(err: unknown): ClassifiedProviderError {
     return new ClassifiedProviderError(message || 'Anthropic overloaded', { kind: 'transient', cause: err });
   }
 
-  // Rate limit.
+  // Rate limit — status-based.
   if (errAny.status === 429) {
+    return new ClassifiedProviderError(message, { kind: 'rate_limit', cause: err });
+  }
+
+  // Rate limit — in-band text (Claude account session/usage limit hit).
+  // The Claude SDK surfaces these as streaming assistant-text rather than HTTP
+  // errors, so the catch block never sees a 429. The stream loop throws with a
+  // message containing this wording after detecting it in textContent.
+  // Regex is case-insensitive and anchored to avoid matching unrelated "limit"
+  // occurrences (e.g. "file size limit").
+  if (
+    /\b(session|usage) limit\b/i.test(message) ||
+    /hit your (session|usage) limit/i.test(message)
+  ) {
     return new ClassifiedProviderError(message, { kind: 'rate_limit', cause: err });
   }
 
@@ -378,6 +391,22 @@ export class ClaudeProvider {
             throw new Error('Invalid API key: check your API key configuration in ~/.claude-mem/settings.json or ~/.claude-mem/.env');
           }
 
+          // In-band rate-limit detection: Claude account session/usage limits
+          // are delivered as assistant text in the stream, not as HTTP errors.
+          // Throw before processAgentResponse so the limit message never reaches
+          // the prose/XML path. The thrown message matches the rate_limit branch
+          // in classifyClaudeError so the catch block triggers pool rotation.
+          if (
+            typeof textContent === 'string' &&
+            (/\b(session|usage) limit\b/i.test(textContent) ||
+              /hit your (session|usage) limit/i.test(textContent))
+          ) {
+            throw new Error(
+              'Claude usage limit reached: ' +
+              (textContent.length > 80 ? textContent.slice(0, 80) + '...' : textContent),
+            );
+          }
+
           await processAgentResponse(
             textContent,
             session,
@@ -476,7 +505,9 @@ export class ClaudeProvider {
         return undefined;
       })();
 
-      if (rotatable && oauthTokenPool.size > 0 && oauthTokenPool.lastSelectedId) {
+      const tokenSelection = getLastTokenSelection();
+
+      if (rotatable && tokenSelection?.source === 'file-fallback' && oauthTokenPool.lastSelectedId) {
         // Pool path: mark the token that just failed.
         oauthTokenPool.markCooldown(
           oauthTokenPool.lastSelectedId,
@@ -500,6 +531,20 @@ export class ClaudeProvider {
         // Whether or not the pool is exhausted, re-throw so upstream
         // classification/retry is unchanged. The next call will selectToken()
         // fresh — it either gets a healthy token or the soonest-expiring one.
+      } else if (
+        rotatable &&
+        (tokenSelection?.source === 'keychain' || tokenSelection?.source === 'env-fallback')
+      ) {
+        // Keychain / env-fallback path: set a cooldown so the next
+        // readClaudeOAuthToken call falls through to the pool instead of
+        // returning the rate-limited token. If the pool is empty, the keychain
+        // token is still used (last-resort in readClaudeOAuthToken).
+        markKeychainCooldown(kind as CooldownKind, retryAfterMs);
+        logger.info('OAUTH', `Keychain/env token cooled after ${kind}; next call will try pool`, {
+          source: tokenSelection.source,
+          kind,
+          sessionDbId: session.sessionDbId,
+        });
       } else if (kind === 'auth_invalid') {
         // Keychain / env single-token path: immediate stale marker.
         writeStaleMarker(

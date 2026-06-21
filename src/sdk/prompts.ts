@@ -75,6 +75,9 @@ ${mode.prompts.format_examples}
 
 ${mode.prompts.footer}
 
+Return only <observation>...</observation> XML blocks, or an empty response if there is nothing substantive to record yet.
+Never reply with prose such as "No observations to record", a greeting, or any explanation outside XML. Non-XML text is discarded.
+
 ${mode.prompts.header_memory_start}`;
 }
 
@@ -242,5 +245,8 @@ ${mode.prompts.format_examples}
 
 ${mode.prompts.footer}
 
+Return only <observation>...</observation> XML blocks, or an empty response if there is nothing substantive to record yet.
+Never reply with prose such as "No observations to record", a greeting, or any explanation outside XML. Non-XML text is discarded.
+
 ${mode.prompts.header_memory_continued}`;
-} 
+}

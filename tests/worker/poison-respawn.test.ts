@@ -112,7 +112,7 @@ describe('poison respawn (plan-11 #2485)', () => {
     expect(session.consecutiveInvalidOutputs).toBe(0); // reset on respawn
   });
 
-  it('respawns only after N consecutive prose/idle outputs, not on the first', async () => {
+  it('does NOT respawn on repeated prose outputs, even far past the threshold (anti poison-loop)', async () => {
     const sm = new SessionManager(makeDbManager());
     const session = sm.initializeSession(2, 'do the thing', 1);
     session.memorySessionId = 'mem-2';
@@ -122,22 +122,38 @@ describe('poison respawn (plan-11 #2485)', () => {
 
     const respawnSpy = spyOn(sm, 'respawnPoisonedSession');
 
-    // First (threshold - 1) prose responses must NOT respawn.
-    for (let i = 0; i < INVALID_OUTPUT_RESPAWN_THRESHOLD - 1; i++) {
+    // A non-XML "nothing to report" prose response is the model declining to emit
+    // XML, NOT a wedged SDK session. Respawning only churns a fresh process that
+    // hits the same wall — the observed poison loop (968 respawns / 4.5h). The
+    // batch is dropped-and-confirmed instead; the session stays alive.
+    for (let i = 0; i < INVALID_OUTPUT_RESPAWN_THRESHOLD + 3; i++) {
       await processAgentResponse(
-        'Just some prose, no XML here.',
+        'No observations to record at this time.',
         session, makeDbManager(), sm, mockWorker, 0, null, 'TestAgent'
       );
     }
-    expect(respawnSpy).not.toHaveBeenCalled();
-    expect(session.consecutiveInvalidOutputs).toBe(INVALID_OUTPUT_RESPAWN_THRESHOLD - 1);
 
-    // The Nth invalid output crosses the threshold and triggers respawn.
-    await processAgentResponse(
-      'Still just prose.',
-      session, makeDbManager(), sm, mockWorker, 0, null, 'TestAgent'
-    );
-    expect(respawnSpy).toHaveBeenCalledWith(2);
+    expect(respawnSpy).not.toHaveBeenCalled();
+    expect(sm.getSession(2)).toBeDefined();
+    expect(session.abortController.signal.aborted).toBe(false);
+  });
+
+  it('does NOT respawn on repeated idle (empty) outputs, even past the threshold', async () => {
+    const sm = new SessionManager(makeDbManager());
+    const session = sm.initializeSession(4, 'do the thing', 1);
+    session.memorySessionId = 'mem-4';
+
+    const respawnSpy = spyOn(sm, 'respawnPoisonedSession');
+
+    for (let i = 0; i < INVALID_OUTPUT_RESPAWN_THRESHOLD + 2; i++) {
+      await processAgentResponse(
+        '', session, makeDbManager(), sm, mockWorker, 0, null, 'TestAgent'
+      );
+    }
+
+    expect(respawnSpy).not.toHaveBeenCalled();
+    expect(sm.getSession(4)).toBeDefined();
+    expect(session.abortController.signal.aborted).toBe(false);
   });
 
   it('respawnPoisonedSession preserves the buffer and resets context', async () => {

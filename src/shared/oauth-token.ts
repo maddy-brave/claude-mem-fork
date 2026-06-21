@@ -16,7 +16,7 @@ import { userInfo } from 'os';
 import { join } from 'path';
 import { paths } from './paths.js';
 import { logger } from '../utils/logger.js';
-import { oauthTokenPool } from './oauth-token-pool.js';
+import { oauthTokenPool, type CooldownKind, DEFAULT_COOLDOWN_MS } from './oauth-token-pool.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -27,6 +27,46 @@ const READ_TIMEOUT_MS = 5000;
 // token through. Claude Desktop typically refreshes shortly before expiry, so
 // a small grace covers clock skew and refresh-in-progress windows.
 const EXPIRY_GRACE_MS = 60_000;
+
+// ---------------------------------------------------------------------------
+// Keychain / env-token cooldown state (B2: poison-loop rate-limit rotation)
+// ---------------------------------------------------------------------------
+
+/** When > Date.now(), the keychain/env token is on cooldown and must be bypassed. */
+let keychainCooldownUntil = 0;
+
+/**
+ * The source of the most-recently returned token from readClaudeOAuthToken.
+ * Set on every `return { kind: 'present', ... }` path so ClaudeProvider can
+ * branch correctly in the catch block without inferring source from pool state.
+ */
+let lastSelection: { source: 'keychain' | 'env-fallback' | 'file-fallback'; poolId?: string } | undefined;
+
+/** True when the keychain/env token is still within its cooldown window. */
+function isKeychainCooling(): boolean {
+  return Date.now() < keychainCooldownUntil;
+}
+
+/**
+ * Mark the keychain / env token on cooldown so the next readClaudeOAuthToken
+ * call falls through to the pool instead of returning the rate-limited token.
+ * Raw token values are never logged; only the cooldown metadata is emitted.
+ */
+export function markKeychainCooldown(kind: CooldownKind, retryAfterMs?: number): void {
+  const duration = retryAfterMs ?? DEFAULT_COOLDOWN_MS[kind];
+  keychainCooldownUntil = Date.now() + duration;
+  logger.info('OAUTH', `Keychain/env token cooled: kind=${kind} cooldownUntil=${new Date(keychainCooldownUntil).toISOString()}`);
+}
+
+/** Reset the keychain/env cooldown (e.g. after the cooldown window passes). */
+export function clearKeychainCooldown(): void {
+  keychainCooldownUntil = 0;
+}
+
+/** Return the source of the most-recently selected token, or undefined. */
+export function getLastTokenSelection(): typeof lastSelection {
+  return lastSelection;
+}
 
 export type OAuthTokenResult =
   | { kind: 'present'; token: string; source: 'keychain' | 'env-fallback' | 'file-fallback'; expiresAt?: number; poolId?: string }
@@ -309,7 +349,12 @@ export async function readClaudeOAuthToken(): Promise<OAuthTokenResult> {
   // values, so we fall through to env-fallback and then the pool. The expired
   // result is still surfaced at the end of this function if env + pool both fail,
   // preserving the writeStaleMarker "re-login via Claude Desktop" signal.
-  if (keychainResult.kind === 'present') {
+  //
+  // Cooling guard (B2 poison-loop fix): when the keychain token is present but
+  // rate-limited, markKeychainCooldown() was called in the ClaudeProvider catch
+  // block. Fall through to env+pool so the next call gets a healthy token.
+  if (keychainResult.kind === 'present' && !isKeychainCooling()) {
+    lastSelection = { source: 'keychain' };
     return keychainResult;
   }
 
@@ -329,6 +374,7 @@ export async function readClaudeOAuthToken(): Promise<OAuthTokenResult> {
       };
     }
 
+    lastSelection = { source: 'env-fallback' };
     return {
       kind: 'present',
       token: envToken,
@@ -346,6 +392,7 @@ export async function readClaudeOAuthToken(): Promise<OAuthTokenResult> {
   // exhaustion).
   const sel = oauthTokenPool.selectToken();
   if (sel) {
+    lastSelection = { source: 'file-fallback', poolId: sel.id };
     return { kind: 'present', token: sel.token, source: 'file-fallback', poolId: sel.id };
   }
 

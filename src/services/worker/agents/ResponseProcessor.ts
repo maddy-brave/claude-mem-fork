@@ -67,13 +67,20 @@ export async function processAgentResponse(
       consecutiveInvalidOutputs: session.consecutiveInvalidOutputs,
     });
 
-    // Recover from poison (plan-11, #2485): a poisoned closure string means the
-    // SDK session is wedged and will keep emitting garbage — respawn immediately.
-    // For idle/prose, only respawn after N consecutive invalid outputs so we
-    // don't churn the session on benign single-batch misses.
-    const mustRespawn =
-      outputClass === 'poisoned' ||
-      session.consecutiveInvalidOutputs >= INVALID_OUTPUT_RESPAWN_THRESHOLD;
+    // Recover from poison (plan-11, #2485): only a genuinely wedged SDK session
+    // — signalled by a known closure/exhaustion marker (outputClass 'poisoned')
+    // — warrants killing and respawning. A fresh process clears a wedged context.
+    //
+    // idle/prose is NOT a respawn trigger (poison-loop fix, 2026-06-21). The model
+    // declining to emit XML ("No observations to record", a greeting, or a
+    // rate-limit notice surfaced as in-band text) is not a wedged session: a fresh
+    // process re-reads the same input, hits the same wall, and the respawn churns
+    // every ~10s indefinitely (observed: 968 respawns over 4.5h, ~14/min of pure
+    // token burn). Such a batch is dropped-and-confirmed below; the session stays
+    // alive to process the next batch. Rate-limit responses are intercepted and
+    // converted to a classifiable error upstream (ClaudeProvider) so the token
+    // pool / tier fallback engages instead of reaching this prose path.
+    const mustRespawn = outputClass === 'poisoned';
 
     if (mustRespawn) {
       logger.error('SESSION', `${agentName} session poisoned — killing and respawning, pending messages preserved`, {
@@ -96,6 +103,19 @@ export async function processAgentResponse(
       });
       await sessionManager.respawnPoisonedSession(session.sessionDbId);
       return;
+    }
+
+    // A run of consecutive non-XML outputs no longer triggers a respawn, but it
+    // still warrants a loud, visible signal (plan-11 "visible, not silent") so a
+    // genuinely stuck-but-unmarked session is diagnosable from the logs without
+    // the churn.
+    if (session.consecutiveInvalidOutputs >= INVALID_OUTPUT_RESPAWN_THRESHOLD) {
+      logger.warn('SESSION', `${agentName} produced ${session.consecutiveInvalidOutputs} consecutive non-XML (${outputClass}) outputs — dropping batch, NOT respawning`, {
+        sessionId: session.sessionDbId,
+        outputClass,
+        consecutiveInvalidOutputs: session.consecutiveInvalidOutputs,
+        threshold: INVALID_OUTPUT_RESPAWN_THRESHOLD,
+      });
     }
 
     // Plain-text skip responses are intentionally ignored. Re-queueing them

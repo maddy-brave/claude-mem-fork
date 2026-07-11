@@ -2,14 +2,14 @@
 import { DatabaseManager } from './DatabaseManager.js';
 import { SessionManager } from './SessionManager.js';
 import { logger } from '../../utils/logger.js';
-import { buildInitPrompt, buildObservationPrompt, buildSummaryPrompt, buildContinuationPrompt } from '../../sdk/prompts.js';
+import { buildInitPrompt, buildObservationPrompt, buildBatchedObservationPrompt, buildSummaryPrompt, buildContinuationPrompt } from '../../sdk/prompts.js';
 import { SettingsDefaultsManager } from '../../shared/SettingsDefaultsManager.js';
 import { USER_SETTINGS_PATH, OBSERVER_SESSIONS_DIR, ensureDir, paths } from '../../shared/paths.js';
 import { buildIsolatedEnvWithFreshOAuth, getAuthMethodDescription } from '../../shared/EnvManager.js';
 import { writeStaleMarker, markKeychainCooldown, getLastTokenSelection } from '../../shared/oauth-token.js';
 import { oauthTokenPool, type CooldownKind } from '../../shared/oauth-token-pool.js';
 import { findClaudeExecutable } from '../../shared/find-claude-executable.js';
-import type { ActiveSession, SDKUserMessage } from '../worker-types.js';
+import type { ActiveSession, SDKUserMessage, PendingMessageWithId } from '../worker-types.js';
 import { ModeManager } from '../domain/ModeManager.js';
 import { processAgentResponse, type WorkerRef } from './agents/index.js';
 import {
@@ -175,6 +175,26 @@ export function classifyClaudeError(err: unknown): ClassifiedProviderError {
   return new ClassifiedProviderError(message, { kind: 'transient', cause: err });
 }
 
+/**
+ * D4 (observer batch/throttle) — true once `pendingBatchLength` buffered
+ * observation messages should be flushed into a single observer SDK turn.
+ * batchSize is clamped to a minimum of 1 (CLAUDE_MEM_OBSERVATION_BATCH_SIZE=1
+ * is the default: flush on every single message, i.e. current behavior).
+ */
+export function shouldFlushObservationBatch(pendingBatchLength: number, batchSize: number): boolean {
+  return pendingBatchLength >= Math.max(1, batchSize);
+}
+
+/**
+ * D4 (observer batch/throttle) — true once a session's cumulative count of
+ * processed observation-type messages has crossed the configured per-session
+ * cap. maxObservationsPerSession<=0 means the cap is disabled
+ * (CLAUDE_MEM_MAX_OBSERVATIONS_PER_SESSION=0 is the default: never drop).
+ */
+export function shouldDropForObservationCap(observationsProcessed: number, maxObservationsPerSession: number): boolean {
+  return maxObservationsPerSession > 0 && observationsProcessed > maxObservationsPerSession;
+}
+
 export class ClaudeProvider {
   private dbManager: DatabaseManager;
   private sessionManager: SessionManager;
@@ -202,8 +222,6 @@ export class ClaudeProvider {
     // accumulator starts from zero — reset the per-turn cost baseline with it.
     session.lastResultTotalCostUsd = null;
 
-    const messageGenerator = this.createMessageGenerator(session, cwdTracker);
-
     const hasRealMemorySessionId = !!session.memorySessionId;
     const shouldResume = hasRealMemorySessionId && session.lastPromptNumber > 1 && !session.forceInit;
 
@@ -218,6 +236,14 @@ export class ClaudeProvider {
     const settings = SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH);
     const maxConcurrent = parseInt(settings.CLAUDE_MEM_MAX_CONCURRENT_AGENTS, 10) || 2;
     await waitForSlot(maxConcurrent, session.abortController.signal);
+
+    // D4 (observer batch/throttle). Both default to current behavior:
+    // batchSize=1 flushes every message immediately (no coalescing);
+    // maxObservationsPerSession=0 disables the cap (never drop).
+    const observationBatchSize = parseInt(settings.CLAUDE_MEM_OBSERVATION_BATCH_SIZE, 10) || 1;
+    const maxObservationsPerSession = parseInt(settings.CLAUDE_MEM_MAX_OBSERVATIONS_PER_SESSION, 10) || 0;
+
+    const messageGenerator = this.createMessageGenerator(session, cwdTracker, observationBatchSize, maxObservationsPerSession);
 
     const isolatedEnv = sanitizeEnv(await buildIsolatedEnvWithFreshOAuth());
     const authMethod = getAuthMethodDescription();
@@ -578,7 +604,9 @@ export class ClaudeProvider {
 
   private async *createMessageGenerator(
     session: ActiveSession,
-    cwdTracker: { lastCwd: string | undefined }
+    cwdTracker: { lastCwd: string | undefined },
+    observationBatchSize: number = 1,
+    maxObservationsPerSession: number = 0
   ): AsyncIterableIterator<SDKUserMessage> {
     const mode = ModeManager.getInstance().getActiveMode();
 
@@ -610,6 +638,51 @@ export class ClaudeProvider {
       isSynthetic: true
     };
 
+    // D4 (observer batch/throttle) — buffered observation messages accumulate
+    // here until shouldFlushObservationBatch() says the batch is full; a
+    // 'summarize' message always flushes any partial batch first (order
+    // preserved), then yields its own turn exactly as before. batchSize=1
+    // (the default) flushes on every single message, i.e. no change from the
+    // prior one-turn-per-tool-call behavior — buildFlush() below routes a
+    // length-1 batch through the original single-item buildObservationPrompt
+    // so the rendered prompt text is byte-identical to pre-D4 behavior.
+    let pendingObsBatch: PendingMessageWithId[] = [];
+
+    const buildFlush = (): SDKUserMessage => {
+      const obsPrompt = pendingObsBatch.length === 1
+        ? buildObservationPrompt({
+            id: 0, // Not used in prompt
+            tool_name: pendingObsBatch[0].tool_name!,
+            tool_input: JSON.stringify(pendingObsBatch[0].tool_input),
+            tool_output: JSON.stringify(pendingObsBatch[0].tool_response),
+            created_at_epoch: Date.now(),
+            cwd: pendingObsBatch[0].cwd
+          })
+        : buildBatchedObservationPrompt(pendingObsBatch.map(m => ({
+            id: 0,
+            tool_name: m.tool_name!,
+            tool_input: JSON.stringify(m.tool_input),
+            tool_output: JSON.stringify(m.tool_response),
+            created_at_epoch: Date.now(),
+            cwd: m.cwd
+          })));
+
+      session.conversationHistory.push({ role: 'user', content: obsPrompt });
+      session.lastPromptSentAt = Date.now();
+      session.lastGeneratorSource = 'ingest';
+
+      return {
+        type: 'user',
+        message: {
+          role: 'user',
+          content: obsPrompt
+        },
+        session_id: session.contentSessionId,
+        parent_tool_use_id: null,
+        isSynthetic: true
+      };
+    };
+
     for await (const message of this.sessionManager.getMessageIterator(session.sessionDbId)) {
       session.pendingAgentId = message.agentId ?? null;
       session.pendingAgentType = message.agentType ?? null;
@@ -623,30 +696,36 @@ export class ClaudeProvider {
           session.lastPromptNumber = message.prompt_number;
         }
 
-        const obsPrompt = buildObservationPrompt({
-          id: 0, // Not used in prompt
-          tool_name: message.tool_name!,
-          tool_input: JSON.stringify(message.tool_input),
-          tool_output: JSON.stringify(message.tool_response),
-          created_at_epoch: Date.now(),
-          cwd: message.cwd
-        });
+        session.observationsProcessed = (session.observationsProcessed ?? 0) + 1;
 
-        session.conversationHistory.push({ role: 'user', content: obsPrompt });
+        if (shouldDropForObservationCap(session.observationsProcessed, maxObservationsPerSession)) {
+          if (!session.observationCapWarned) {
+            session.observationCapWarned = true;
+            logger.warn('SDK', `Per-session observation cap (${maxObservationsPerSession}) tripped — further observations for this session are dropped without an observer turn`, {
+              sessionDbId: session.sessionDbId,
+              contentSessionId: session.contentSessionId,
+              maxObservationsPerSession
+            });
+          }
+          this.sessionManager.dropClaimedMessage(session.sessionDbId, message._persistentId);
+          continue;
+        }
 
-        session.lastPromptSentAt = Date.now();
-        session.lastGeneratorSource = 'ingest';
-        yield {
-          type: 'user',
-          message: {
-            role: 'user',
-            content: obsPrompt
-          },
-          session_id: session.contentSessionId,
-          parent_tool_use_id: null,
-          isSynthetic: true
-        };
+        pendingObsBatch.push(message);
+        if (!shouldFlushObservationBatch(pendingObsBatch.length, observationBatchSize)) {
+          continue;
+        }
+
+        const flushed = buildFlush();
+        pendingObsBatch = [];
+        yield flushed;
       } else if (message.type === 'summarize') {
+        if (pendingObsBatch.length > 0) {
+          const flushed = buildFlush();
+          pendingObsBatch = [];
+          yield flushed;
+        }
+
         const summaryPrompt = buildSummaryPrompt({
           id: session.sessionDbId,
           memory_session_id: session.memorySessionId,

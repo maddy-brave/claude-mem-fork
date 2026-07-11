@@ -221,6 +221,31 @@ export class SessionManager {
     return this.buffer.resetClaimed(sessionDbId);
   }
 
+  /**
+   * D4 (observer batch/throttle) — drop a single already-claimed message
+   * WITHOUT ever sending it through the SDK: remove it from the buffer
+   * (confirm) and drop it from the session's claimedMessageIds bookkeeping.
+   *
+   * Used by the per-session observation cap (CLAUDE_MEM_MAX_OBSERVATIONS_PER_SESSION,
+   * ClaudeProvider.createMessageGenerator) once a session has generated more
+   * observation turns than the cap allows. Messages yielded by
+   * getMessageIterator are already claimed (pushed onto claimedMessageIds);
+   * if a capped message is left claimed-but-never-confirmed, the next
+   * generator restart's resetProcessingToPending would re-yield it forever
+   * (it would just re-trip the cap in an infinite loop). Confirming it here
+   * is the correct terminal state for "intentionally never processed".
+   */
+  dropClaimedMessage(sessionDbId: number, persistentId: number): void {
+    const session = this.sessions.get(sessionDbId);
+    if (session) {
+      const idx = session.claimedMessageIds.indexOf(persistentId);
+      if (idx !== -1) {
+        session.claimedMessageIds.splice(idx, 1);
+      }
+    }
+    this.buffer.confirm(persistentId);
+  }
+
   async confirmClaimedMessages(sessionDbId: number): Promise<number> {
     const session = this.sessions.get(sessionDbId);
     const claimedIds = session?.claimedMessageIds ?? [];

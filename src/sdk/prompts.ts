@@ -153,6 +153,66 @@ Concrete debugging findings from logs, queue state, database rows, session routi
 Never reply with prose such as "Skipping", "No substantive tool executions", or any explanation outside XML. Non-XML text is discarded.`;
 }
 
+function formatObservedFromPrimarySession(obs: Observation): string {
+  let toolInput: any;
+  let toolOutput: any;
+
+  try {
+    toolInput = typeof obs.tool_input === 'string' ? JSON.parse(obs.tool_input) : obs.tool_input;
+  } catch (error: unknown) {
+    logger.debug('SDK', 'Tool input is plain string, using as-is', {
+      toolName: obs.tool_name
+    }, error instanceof Error ? error : new Error(String(error)));
+    toolInput = obs.tool_input;
+  }
+
+  try {
+    toolOutput = typeof obs.tool_output === 'string' ? JSON.parse(obs.tool_output) : obs.tool_output;
+  } catch (error: unknown) {
+    logger.debug('SDK', 'Tool output is plain string, using as-is', {
+      toolName: obs.tool_name
+    }, error instanceof Error ? error : new Error(String(error)));
+    toolOutput = obs.tool_output;
+  }
+
+  return `<observed_from_primary_session>
+  <what_happened>${obs.tool_name}</what_happened>
+  <occurred_at>${new Date(obs.created_at_epoch).toISOString()}</occurred_at>${obs.cwd ? `\n  <working_directory>${obs.cwd}</working_directory>` : ''}
+  <parameters>${truncateObservationField(toolInput)}</parameters>
+  <outcome>${truncateObservationField(toolOutput)}</outcome>
+</observed_from_primary_session>`;
+}
+
+/**
+ * D4 (observer batch/throttle) — coalesce N buffered observation tool-events
+ * into a SINGLE observer turn instead of one turn per tool call. Each event
+ * still gets its own <observed_from_primary_session> block (so per-event
+ * truncation/elision is unchanged, see truncateObservationField), but the
+ * XML-only guard footer is emitted once for the whole batch rather than
+ * repeated per event — this is the actual token/turn-count reduction lever
+ * (arm1-claude-mem-observer.md ranked fix #3): fewer turns means fewer
+ * cache-read-compounding round trips into the same persistent SDK session.
+ *
+ * batchSize=1 (the default, see CLAUDE_MEM_OBSERVATION_BATCH_SIZE) always
+ * calls this with a single-element array, which renders byte-identical in
+ * shape to buildObservationPrompt's single-event framing (same block, same
+ * guard language) — so the default-off case is not a behavior change.
+ */
+export function buildBatchedObservationPrompt(observations: Observation[]): string {
+  const blocks = observations.map(formatObservedFromPrimarySession).join('\n\n');
+  const countNote = observations.length > 1
+    ? `The ${observations.length} tool-use events above happened in order, in the same primary-session turn. `
+    : '';
+
+  return `${blocks}
+
+${countNote}If a <parameters> or <outcome> block above contains an "<elided chars=... />" marker, that field was truncated to fit the observer's context window. Describe only what you can see in the kept portion and do not infer details about the elided range.
+
+Return either one or more <observation>...</observation> blocks (one per distinct durable discovery across the event(s) above, not necessarily one per event), or an empty response if none of the event(s) above are worth recording.
+Concrete debugging findings from logs, queue state, database rows, session routing, or code-path inspection count as durable discoveries and should be recorded.
+Never reply with prose such as "Skipping", "No substantive tool executions", or any explanation outside XML. Non-XML text is discarded.`;
+}
+
 export function buildSummaryPrompt(session: SDKSession, mode: ModeConfig): string {
   const lastAssistantMessage = session.last_assistant_message || (() => {
     logger.error('SDK', 'Missing last_assistant_message in session for summary prompt', {

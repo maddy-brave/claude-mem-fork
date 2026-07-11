@@ -60,6 +60,10 @@ export interface ActiveSession {
   pendingCompressionEvent?: Record<string, unknown> | null;
   /** Cumulative total_cost_usd from the SDK's latest result message — per-compression cost is the delta between results. */
   lastResultTotalCostUsd?: number | null;
+  /** D4 — count of observation-type messages processed (batched-or-not) for this session, used by CLAUDE_MEM_MAX_OBSERVATIONS_PER_SESSION. */
+  observationsProcessed?: number;
+  /** D4 — set once the per-session observation cap has fired the one-time loud warn log, so subsequent drops stay quiet. */
+  observationCapWarned?: boolean;
 }
 
 export interface PendingMessage {

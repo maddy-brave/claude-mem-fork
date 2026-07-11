@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'bun:test';
 
-import { buildObservationPrompt, buildInitPrompt, buildContinuationPrompt } from '../../src/sdk/prompts.js';
+import { buildObservationPrompt, buildBatchedObservationPrompt, buildInitPrompt, buildContinuationPrompt } from '../../src/sdk/prompts.js';
 import type { ModeConfig } from '../../src/services/domain/types.js';
 
 // Minimal stub covering only the keys interpolated by buildInitPrompt and
@@ -62,6 +62,66 @@ describe('buildObservationPrompt', () => {
     expect(prompt).toContain('Return either one or more <observation>...</observation> blocks, or an empty response');
     expect(prompt).toContain('Concrete debugging findings from logs, queue state, database rows, session routing, or code-path inspection');
     expect(prompt).toContain('Never reply with prose such as "Skipping", "No substantive tool executions"');
+  });
+});
+
+// D4 (observer batch/throttle) — coalesce N buffered tool-use events into a
+// single observer turn (arm1-claude-mem-observer.md ranked fix #3). See
+// ClaudeProvider.createMessageGenerator: batchSize=1 always routes through
+// buildObservationPrompt (unchanged), so buildBatchedObservationPrompt only
+// needs to prove correct behavior for batch.length > 1.
+describe('buildBatchedObservationPrompt (D4 observer batch/throttle)', () => {
+  const makeObs = (n: number) => ({
+    id: n,
+    tool_name: `Tool${n}`,
+    tool_input: JSON.stringify({ arg: n }),
+    tool_output: JSON.stringify({ result: n }),
+    created_at_epoch: Date.now(),
+    cwd: `/repo${n}`,
+  });
+
+  it('emits one <observed_from_primary_session> block per event', () => {
+    const prompt = buildBatchedObservationPrompt([makeObs(1), makeObs(2), makeObs(3)]);
+
+    const blockCount = (prompt.match(/<observed_from_primary_session>/g) ?? []).length;
+    expect(blockCount).toBe(3);
+    expect(prompt).toContain('<what_happened>Tool1</what_happened>');
+    expect(prompt).toContain('<what_happened>Tool2</what_happened>');
+    expect(prompt).toContain('<what_happened>Tool3</what_happened>');
+  });
+
+  it('emits the XML-only guard footer exactly once regardless of batch size', () => {
+    const prompt = buildBatchedObservationPrompt([makeObs(1), makeObs(2), makeObs(3), makeObs(4)]);
+
+    const footerCount = (prompt.match(/Non-XML text is discarded\./g) ?? []).length;
+    expect(footerCount).toBe(1);
+    expect(prompt).toContain('Return either one or more <observation>...</observation> blocks');
+  });
+
+  it('notes the event count for multi-event batches, omits it for a single event', () => {
+    const multi = buildBatchedObservationPrompt([makeObs(1), makeObs(2)]);
+    expect(multi).toContain('The 2 tool-use events above happened in order');
+
+    const single = buildBatchedObservationPrompt([makeObs(1)]);
+    expect(single).not.toContain('tool-use events above happened in order');
+  });
+
+  it('still elides an oversized field per event (#2468 truncation applies per-event)', () => {
+    const huge = 'HEAD_SENTINEL' + 'A'.repeat(60_000) + 'TAIL_SENTINEL';
+    const obsWithHugeOutput = {
+      id: 9,
+      tool_name: 'Read',
+      tool_input: JSON.stringify({ file: 'big.txt' }),
+      tool_output: JSON.stringify({ content: huge }),
+      created_at_epoch: Date.now(),
+      cwd: '/repo',
+    };
+    const prompt = buildBatchedObservationPrompt([makeObs(1), obsWithHugeOutput]);
+
+    expect(prompt).toContain('<elided');
+    expect(prompt).toContain('reason="oversize"');
+    expect(prompt).toContain('HEAD_SENTINEL');
+    expect(prompt).toContain('TAIL_SENTINEL');
   });
 });
 

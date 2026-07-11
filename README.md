@@ -8,6 +8,9 @@
     </picture>
   </a>
   <br>
+  <a href="https://vercel.com/open-source-program">
+    <img alt="Vercel OSS Program" src="https://vercel.com/oss/program-badge-2026.svg" />
+  </a>
 </h1>
 
 <p align="center">
@@ -133,15 +136,16 @@ Install with a single command:
 npx claude-mem install
 ```
 
-Or install for Gemini CLI (auto-detects `~/.gemini`):
-
-```bash
-npx claude-mem install --ide gemini-cli
-```
 Or install for OpenCode:
 
 ```bash
 npx claude-mem install --ide opencode
+```
+
+Or install for Antigravity CLI ([setup guide](https://docs.claude-mem.ai/antigravity-cli/setup)):
+
+```bash
+npx claude-mem install --ide antigravity
 ```
 
 Or install from the plugin marketplace inside Claude Code:
@@ -152,7 +156,7 @@ Or install from the plugin marketplace inside Claude Code:
 /plugin install claude-mem
 ```
 
-Restart Claude Code or Gemini CLI. Context from previous sessions will automatically appear in new sessions.
+Restart Claude Code. Context from previous sessions will automatically appear in new sessions.
 
 > **Note:** Claude-Mem is also published on npm, but `npm install -g claude-mem` installs the **SDK/library only** — it does not register the plugin hooks or set up the worker service. Always install via `npx claude-mem install` or the `/plugin` commands above.
 
@@ -188,7 +192,6 @@ The installer handles dependencies, plugin setup, AI provider configuration, wor
 ### Getting Started
 
 - **[Installation Guide](https://docs.claude-mem.ai/installation)** - Quick start & advanced installation
-- **[Gemini CLI Setup](https://docs.claude-mem.ai/gemini-cli/setup)** - Dedicated guide for Google's Gemini CLI integration
 - **[Usage Guide](https://docs.claude-mem.ai/usage/getting-started)** - How Claude-Mem works automatically
 - **[Search Tools](https://docs.claude-mem.ai/usage/search-tools)** - Query your project history with natural language
 - **[Beta Features](https://docs.claude-mem.ai/beta-features)** - Try experimental features like Endless Mode
@@ -378,6 +381,11 @@ Contributions are welcome! Please:
 3. Make your changes with tests
 4. Update documentation
 5. Submit a Pull Request
+
+Claude-Mem ships from three branches: `main` (stable), `core-dev`, and
+`community-edge`. Only `main` is published to npm; the others are run from source.
+See [Release Branches](https://docs.claude-mem.ai/branches) for the strategy and
+how to run the non-stable lines locally.
 
 See [Development Guide](https://docs.claude-mem.ai/development) for contribution workflow.
 

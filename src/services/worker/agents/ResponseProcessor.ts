@@ -1,9 +1,11 @@
 
 import { logger } from '../../../utils/logger.js';
 import { parseAgentXml, type ParsedObservation, type ParsedSummary } from '../../../sdk/parser.js';
-import { classifyObserverOutput, previewOutput } from '../../../sdk/output-classifier.js';
-import { verifyCommitHashesInText } from '../../../sdk/commit-verification.js';
-import { ingestSummary } from '../http/shared.js';
+import {
+  classifyObserverOutput,
+  isQuotaLimitedObserverOutput,
+  previewOutput,
+} from '../../../sdk/output-classifier.js';
 import { updateCursorContextForProject } from '../../integrations/CursorHooksInstaller.js';
 import { notifyTelegram } from '../../integrations/TelegramNotifier.js';
 import { updateFolderClaudeMdFiles } from '../../../utils/claude-md-utils.js';
@@ -15,14 +17,7 @@ import type { DatabaseManager } from '../DatabaseManager.js';
 import type { SessionManager } from '../SessionManager.js';
 import type { WorkerRef, StorageResult } from './types.js';
 import { broadcastObservation, broadcastSummary } from './ObservationBroadcaster.js';
-import { captureEvent } from '../../telemetry/telemetry.js';
-
-/**
- * Consecutive non-XML observer outputs tolerated before we kill and respawn the
- * SDK session (plan-11, #2485). Idle and prose both count; poisoned triggers an
- * immediate respawn regardless of the count.
- */
-export const INVALID_OUTPUT_RESPAWN_THRESHOLD = 3;
+import { telemetryBuffer } from '../../telemetry/buffer.js';
 
 export async function processAgentResponse(
   text: string,
@@ -53,12 +48,32 @@ export async function processAgentResponse(
     'claude';
 
   if (!parsed.valid) {
-    // Classify the non-XML output so a dropped batch is VISIBLE, not silent
-    // (plan-11, #2485). Attach a preview for diagnostics.
+    if (isQuotaLimitedObserverOutput(text)) {
+      session.consecutiveInvalidOutputs = 0;
+
+      logger.warn('PARSER', `${agentName} returned quota-limit prose — pausing generator and preserving queued batch`, {
+        sessionId: session.sessionDbId,
+        outputClass: 'prose',
+        preview: previewOutput(text),
+      });
+
+      await sessionManager.resetProcessingToPending(session.sessionDbId);
+      session.abortReason = 'quota:observer_text';
+      try {
+        session.abortController.abort();
+      } catch {
+        // best-effort; AbortController.abort() should not throw in normal use.
+      }
+      worker?.broadcastProcessingStatus?.();
+      return;
+    }
+
+    // Classify the non-XML output so a dropped batch is visible, not silent.
+    // Ordinary idle/prose is a claimed no-op batch: confirm it and do not build
+    // any respawn debt from repeated skip acknowledgements.
     const outputClass = classifyObserverOutput(text);
     const preview = previewOutput(text);
-
-    session.consecutiveInvalidOutputs = (session.consecutiveInvalidOutputs ?? 0) + 1;
+    session.consecutiveInvalidOutputs = 0;
 
     logger.warn('PARSER', `${agentName} returned non-XML ${outputClass} response — ignoring queued batch`, {
       sessionId: session.sessionDbId,
@@ -67,60 +82,8 @@ export async function processAgentResponse(
       consecutiveInvalidOutputs: session.consecutiveInvalidOutputs,
     });
 
-    // Recover from poison (plan-11, #2485): only a genuinely wedged SDK session
-    // — signalled by a known closure/exhaustion marker (outputClass 'poisoned')
-    // — warrants killing and respawning. A fresh process clears a wedged context.
-    //
-    // idle/prose is NOT a respawn trigger (poison-loop fix, 2026-06-21). The model
-    // declining to emit XML ("No observations to record", a greeting, or a
-    // rate-limit notice surfaced as in-band text) is not a wedged session: a fresh
-    // process re-reads the same input, hits the same wall, and the respawn churns
-    // every ~10s indefinitely (observed: 968 respawns over 4.5h, ~14/min of pure
-    // token burn). Such a batch is dropped-and-confirmed below; the session stays
-    // alive to process the next batch. Rate-limit responses are intercepted and
-    // converted to a classifiable error upstream (ClaudeProvider) so the token
-    // pool / tier fallback engages instead of reaching this prose path.
-    const mustRespawn = outputClass === 'poisoned';
-
-    if (mustRespawn) {
-      logger.error('SESSION', `${agentName} session poisoned — killing and respawning, pending messages preserved`, {
-        sessionId: session.sessionDbId,
-        outputClass,
-        consecutiveInvalidOutputs: session.consecutiveInvalidOutputs,
-        threshold: INVALID_OUTPUT_RESPAWN_THRESHOLD,
-      });
-      // Respawn-gated telemetry ONLY (never per invalid output — volume).
-      // Closed enums and counts; the raw model output never leaves the box.
-      captureEvent('session_compressed', {
-        outcome: 'invalid_output',
-        invalid_output_class: outputClass,
-        consecutive_invalid_outputs: session.consecutiveInvalidOutputs,
-        respawn_triggered: true,
-        provider: providerName,
-        model: typeof modelId === 'string' && modelId ? modelId : 'unknown',
-        ide: session.platformSource,
-        hook: session.lastGeneratorSource,
-      });
-      await sessionManager.respawnPoisonedSession(session.sessionDbId);
-      return;
-    }
-
-    // A run of consecutive non-XML outputs no longer triggers a respawn, but it
-    // still warrants a loud, visible signal (plan-11 "visible, not silent") so a
-    // genuinely stuck-but-unmarked session is diagnosable from the logs without
-    // the churn.
-    if (session.consecutiveInvalidOutputs >= INVALID_OUTPUT_RESPAWN_THRESHOLD) {
-      logger.warn('SESSION', `${agentName} produced ${session.consecutiveInvalidOutputs} consecutive non-XML (${outputClass}) outputs — dropping batch, NOT respawning`, {
-        sessionId: session.sessionDbId,
-        outputClass,
-        consecutiveInvalidOutputs: session.consecutiveInvalidOutputs,
-        threshold: INVALID_OUTPUT_RESPAWN_THRESHOLD,
-      });
-    }
-
     // Plain-text skip responses are intentionally ignored. Re-queueing them
-    // creates an observer loop where the same low-signal batch is retried
-    // until the restart guard fires or the provider quota is exhausted.
+    // creates an observer loop where the same low-signal batch is retried.
     await sessionManager.confirmClaimedMessages(session.sessionDbId);
     session.earliestPendingTimestamp = null;
     return;
@@ -143,39 +106,6 @@ export async function processAgentResponse(
 
   const { observations, summary } = parsed;
   const summaryForStore = normalizeSummaryForStorage(summary);
-
-  // Verify before persist (plan-11, #2574): the summarizer can fabricate a
-  // nonexistent commit hash while keeping files_modified accurate, poisoning
-  // future context injection. Cross-check any emitted commit hash against
-  // ground truth via `git cat-file -e` in the session's repo and strip
-  // fabricated hashes from the persisted text. projectRoot carries the cwd of
-  // the most recently observed tool-use.
-  let fabricatedCount = 0;
-  if (summaryForStore) {
-    const { fabricated } = verifyCommitHashesInText(
-      [
-        summaryForStore.request,
-        summaryForStore.investigated,
-        summaryForStore.learned,
-        summaryForStore.completed,
-        summaryForStore.next_steps,
-        summaryForStore.notes,
-      ],
-      projectRoot,
-      session.contentSessionId
-    );
-
-    fabricatedCount = fabricated.length;
-
-    if (fabricated.length > 0) {
-      logger.warn('PARSER', `${agentName} summary referenced fabricated commit hash(es); flagging before persist`, {
-        sessionId: session.sessionDbId,
-        fabricated,
-        cwd: projectRoot ?? '(none)',
-      });
-      stripFabricatedHashesFromSummary(summaryForStore, fabricated);
-    }
-  }
 
   const sessionStore = dbManager.getSessionStore();
   sessionStore.ensureMemorySessionIdRegistered(session.sessionDbId, session.memorySessionId, getWorkerPort());
@@ -243,10 +173,6 @@ export async function processAgentResponse(
     hook: session.lastGeneratorSource,
     endpoint_class: session.endpointClass,
     compression_ms: compressionMs,
-    // Fabrication signals live HERE (not at the ClaudeProvider merge) so they
-    // flow through all three emit paths: immediate, deferred, and no-result.
-    fabrication_detected: fabricatedCount > 0,
-    fabricated_count: fabricatedCount,
     observation_type: labeledObservations.length > 0 ? dominantType : undefined,
     obs_type_bugfix: typeCounts.bugfix,
     obs_type_discovery: typeCounts.discovery,
@@ -263,11 +189,11 @@ export async function processAgentResponse(
     // still-stashed event here means the prior turn never produced a result
     // (abort/kill): ship it without token fields rather than lose it.
     if (session.pendingCompressionEvent) {
-      captureEvent('session_compressed', session.pendingCompressionEvent);
+      telemetryBuffer.record('session_compressed', session.sessionDbId, session.pendingCompressionEvent);
     }
     session.pendingCompressionEvent = compressionProps;
   } else {
-    captureEvent('session_compressed', {
+    telemetryBuffer.record('session_compressed', session.sessionDbId, {
       ...compressionProps,
       tokens_input: usage?.input,
       tokens_output: usage?.output,
@@ -278,16 +204,6 @@ export async function processAgentResponse(
         usage && usage.input > 0 && usage.output > 0
           ? Math.round((usage.input / usage.output) * 100) / 100
           : undefined,
-    });
-  }
-
-  if (summary && (summary.skipped || session.lastSummaryStored)) {
-    await ingestSummary({
-      kind: 'parsed',
-      sessionDbId: session.sessionDbId,
-      messageId: -1,
-      contentSessionId: session.contentSessionId,
-      parsed: summary,
     });
   }
 
@@ -308,7 +224,6 @@ export async function processAgentResponse(
     session,
     dbManager,
     worker,
-    discoveryTokens,
     agentName,
     projectRoot
   );
@@ -320,7 +235,6 @@ export async function processAgentResponse(
     session,
     dbManager,
     worker,
-    discoveryTokens,
     agentName
   );
 }
@@ -346,49 +260,20 @@ function normalizeSummaryForStorage(summary: ParsedSummary | null): {
   };
 }
 
-type StorableSummary = {
-  request: string;
-  investigated: string;
-  learned: string;
-  completed: string;
-  next_steps: string;
-  notes: string | null;
-};
-
-/**
- * Replace each fabricated commit hash in the summary's text fields with a
- * `[unverified commit]` marker so the false claim is neither persisted nor
- * silently dropped — it is flagged in place (plan-11, #2574). Mutates in place.
- */
-function stripFabricatedHashesFromSummary(summary: StorableSummary, fabricated: string[]): void {
-  if (fabricated.length === 0) return;
-  const replace = (value: string | null): string | null => {
-    if (!value) return value;
-    let next = value;
-    for (const hash of fabricated) {
-      // Word-boundary replace, case-insensitive: hashes were lowercased on extraction.
-      next = next.replace(new RegExp(`\\b${hash}\\b`, 'gi'), '[unverified commit]');
-    }
-    return next;
-  };
-  summary.request = replace(summary.request) ?? '';
-  summary.investigated = replace(summary.investigated) ?? '';
-  summary.learned = replace(summary.learned) ?? '';
-  summary.completed = replace(summary.completed) ?? '';
-  summary.next_steps = replace(summary.next_steps) ?? '';
-  summary.notes = replace(summary.notes);
-}
-
 async function syncAndBroadcastObservations(
   observations: ParsedObservation[],
   result: StorageResult,
   session: ActiveSession,
   dbManager: DatabaseManager,
   worker: WorkerRef | undefined,
-  discoveryTokens: number,
   agentName: string,
   projectRoot?: string
 ): Promise<void> {
+  const memorySessionId = session.memorySessionId;
+  if (!memorySessionId) {
+    return;
+  }
+
   // Dedupe observation IDs before sync/broadcast: storeObservations may collapse
   // multiple parsed observations onto the same row via content_hash, producing
   // duplicate IDs. Syncing them 1:1 triggers repeated Chroma "IDs already exist"
@@ -410,12 +295,12 @@ async function syncAndBroadcastObservations(
 
     dbManager.getChromaSync()?.syncObservation(
       obsId,
-      session.contentSessionId,
+      memorySessionId,
       session.project,
       obs,
       session.lastPromptNumber,
       result.createdAtEpoch,
-      discoveryTokens
+      session.platformSource
     ).then(() => {
       const chromaDuration = Date.now() - chromaStart;
       logger.debug('CHROMA', 'Observation synced', {
@@ -483,10 +368,13 @@ async function syncAndBroadcastSummary(
   session: ActiveSession,
   dbManager: DatabaseManager,
   worker: WorkerRef | undefined,
-  discoveryTokens: number,
   agentName: string
 ): Promise<void> {
   if (!summaryForStore || !result.summaryId) {
+    return;
+  }
+  const memorySessionId = session.memorySessionId;
+  if (!memorySessionId) {
     return;
   }
 
@@ -494,12 +382,12 @@ async function syncAndBroadcastSummary(
 
   dbManager.getChromaSync()?.syncSummary(
     result.summaryId,
-    session.contentSessionId,
+    memorySessionId,
     session.project,
     summaryForStore,
     session.lastPromptNumber,
     result.createdAtEpoch,
-    discoveryTokens
+    session.platformSource
   ).then(() => {
     const chromaDuration = Date.now() - chromaStart;
     logger.debug('CHROMA', 'Summary synced', {
@@ -529,7 +417,7 @@ async function syncAndBroadcastSummary(
     created_at_epoch: result.createdAtEpoch
   });
 
-  updateCursorContextForProject(session.project, getWorkerPort()).catch(error => {
+  updateCursorContextForProject(session.project).catch(error => {
     logger.warn('CURSOR', 'Context update failed (non-critical)', { project: session.project }, error as Error);
   });
 }

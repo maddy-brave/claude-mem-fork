@@ -3,14 +3,26 @@ import path from 'path';
 import net from 'net';
 import { readFileSync } from 'fs';
 import { logger } from '../../utils/logger.js';
-import { MARKETPLACE_ROOT } from '../../shared/paths.js';
+import { SettingsDefaultsManager } from '../../shared/SettingsDefaultsManager.js';
+import { MARKETPLACE_ROOT, USER_SETTINGS_PATH } from '../../shared/paths.js';
+
+function getWorkerHost(): string {
+  return SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH).CLAUDE_MEM_WORKER_HOST;
+}
+
+// Bracket IPv6 literals so a `CLAUDE_MEM_WORKER_HOST` of `::1` yields a valid
+// `http://[::1]:port` URL instead of the malformed `http://::1:port`.
+function formatHostForUrl(host: string): string {
+  if (host.startsWith('[') && host.endsWith(']')) return host;
+  return host.includes(':') ? `[${host}]` : host;
+}
 
 async function httpRequestToWorker(
   port: number,
   endpointPath: string,
   method: string = 'GET'
 ): Promise<{ ok: boolean; statusCode: number; body: string }> {
-  const response = await fetch(`http://127.0.0.1:${port}${endpointPath}`, { method });
+  const response = await fetch(`http://${formatHostForUrl(getWorkerHost())}:${port}${endpointPath}`, { method });
   let body = '';
   try {
     body = await response.text();
@@ -22,11 +34,13 @@ async function httpRequestToWorker(
 
 // Kernel-level bind probe. Detects "is anything bound to this port", including
 // Windows TCP zombies (LISTENING socket attached to a dead PID with no userspace
-// owner). The Windows branch previously used a /api/health fetch which conflated
-// "worker healthy" with "port bound" — phantom listeners returned false and the
-// caller would happily spawn a new worker that immediately failed with
-// EADDRINUSE. Bind-probe is the only reliable cross-platform check.
-export async function isPortInUse(port: number, host: string = '127.0.0.1'): Promise<boolean> {
+// owner). Upstream's Windows branch uses a /api/health fetch which conflates
+// "worker healthy" with "port bound" — phantom listeners return false and the
+// caller happily spawns a new worker that immediately fails with EADDRINUSE.
+// Bind-probe is the only reliable cross-platform check. Host defaults to the
+// configured worker host (upstream v13.10.1 semantics) so the probe binds where
+// the worker would bind.
+export async function isPortInUse(port: number, host: string = getWorkerHost()): Promise<boolean> {
   return new Promise((resolve) => {
     const server = net.createServer();
     server.once('error', (err: NodeJS.ErrnoException) => {
@@ -121,7 +135,7 @@ export function getInstalledPluginVersion(): string {
 
 export async function getRunningWorkerVersion(port: number): Promise<string | null> {
   try {
-    const result = await httpRequestToWorker(port, '/api/version');
+    const result = await httpRequestToWorker(port, '/api/health');
     if (!result.ok) return null;
     const data = JSON.parse(result.body) as { version: string };
     return data.version;

@@ -1,5 +1,5 @@
 import path from "path";
-import { readFileSync, existsSync, writeFileSync, renameSync, mkdirSync } from "fs";
+import { readFileSync, existsSync, writeFileSync, renameSync, mkdirSync, readdirSync, statSync } from "fs";
 import { spawnHidden } from "./spawn.js";
 import { logger } from "../utils/logger.js";
 import { HOOK_TIMEOUTS, getTimeout } from "./hook-constants.js";
@@ -8,7 +8,10 @@ import { MARKETPLACE_ROOT, DATA_DIR } from "./paths.js";
 import { loadFromFileOnce } from "./hook-settings.js";
 import { validateWorkerPidFile } from "../supervisor/index.js";
 import { isPortInUse } from "../services/infrastructure/HealthMonitor.js";
-import { readPidFile, isProcessAlive } from "../services/infrastructure/ProcessManager.js";
+import { readPidFile } from "../services/infrastructure/ProcessManager.js";
+// Upstream v13.10.x removed ProcessManager.isProcessAlive; isPidAlive is its
+// successor (same kill(pid,0) probe, saner pid===0 handling for pidfile checks).
+import { isPidAlive } from "../supervisor/process-registry.js";
 import { emitBlockingError } from "./hook-io.js";
 import { captureCliEvent } from "../services/telemetry/cli-telemetry.js";
 import { checkVersionMatch } from "../services/infrastructure/index.js";
@@ -44,12 +47,6 @@ const HEALTH_CHECK_TIMEOUT_MS = readTimeoutEnv(
   { min: 500, max: 300000 }
 );
 
-const API_REQUEST_TIMEOUT_MS = readTimeoutEnv(
-  'CLAUDE_MEM_API_TIMEOUT_MS',
-  getTimeout(HOOK_TIMEOUTS.API_REQUEST),
-  { min: 500, max: 300000 }
-);
-
 const HOOK_READINESS_TIMEOUT_MS = readTimeoutEnv(
   'CLAUDE_MEM_HOOK_READINESS_TIMEOUT_MS',
   getTimeout(HOOK_TIMEOUTS.HOOK_READINESS_WAIT),
@@ -58,17 +55,20 @@ const HOOK_READINESS_TIMEOUT_MS = readTimeoutEnv(
 
 const API_REQUEST_TIMEOUT_BOUNDS = { min: 500, max: 300000 } as const;
 
-export function fetchWithTimeout(url: string, init: RequestInit = {}, timeoutMs: number): Promise<Response> {
-  return new Promise((resolve, reject) => {
-    const timeoutId = setTimeout(
-      () => reject(new Error(`Request timed out after ${timeoutMs}ms`)),
-      timeoutMs
-    );
-    fetch(url, init).then(
-      response => { clearTimeout(timeoutId); resolve(response); },
-      err => { clearTimeout(timeoutId); reject(err); }
-    );
-  });
+export async function fetchWithTimeout(url: string, init: RequestInit = {}, timeoutMs: number): Promise<Response> {
+  try {
+    // AbortSignal.timeout (Node 18+) replaces the manual setTimeout/clearTimeout
+    // race. On expiry it aborts with a TimeoutError DOMException.
+    return await fetch(url, { ...init, signal: AbortSignal.timeout(timeoutMs) });
+  } catch (err: unknown) {
+    // Preserve the historical timeout-error message ("...timed out...") that
+    // callers match on (hook-command.ts, server-beta-client.ts) — the
+    // DOMException text is runtime-dependent, so normalize it here.
+    if (err instanceof DOMException && err.name === 'TimeoutError') {
+      throw new Error(`Request timed out after ${timeoutMs}ms`);
+    }
+    throw err;
+  }
 }
 
 let cachedPort: number | null = null;
@@ -142,7 +142,7 @@ export function getConfiguredWorkerPort(): number {
 function readLivePidPort(): number | null {
   const info = readPidFile();
   if (!info || typeof info.port !== 'number' || typeof info.pid !== 'number') return null;
-  if (!isProcessAlive(info.pid)) return null;
+  if (!isPidAlive(info.pid)) return null;
   return info.port;
 }
 
@@ -191,8 +191,13 @@ export function clearPortCache(): void {
   cachedApiRequestTimeoutMs = null;
 }
 
+export function formatHostForUrl(host: string): string {
+  if (host.startsWith('[') && host.endsWith(']')) return host;
+  return host.includes(':') ? `[${host}]` : host;
+}
+
 export function buildWorkerUrl(apiPath: string): string {
-  return `http://${getWorkerHost()}:${getWorkerPort()}${apiPath}`;
+  return `http://${formatHostForUrl(getWorkerHost())}:${getWorkerPort()}${apiPath}`;
 }
 
 export function workerHttpRequest(
@@ -232,15 +237,50 @@ async function isWorkerReady(): Promise<boolean> {
   return response.ok;
 }
 
+function candidateWorkerScriptPath(root: string): string {
+  const pluginRoot = existsSync(path.join(root, 'plugin', 'scripts'))
+    ? path.join(root, 'plugin')
+    : root;
+  return path.join(pluginRoot, 'scripts', 'worker-service.cjs');
+}
+
+function cacheWorkerScriptCandidates(): string[] {
+  const pluginsRoot = path.dirname(path.dirname(MARKETPLACE_ROOT));
+  const cacheRoot = path.join(pluginsRoot, 'cache', 'thedotmack', 'claude-mem');
+  try {
+    return readdirSync(cacheRoot)
+      .filter(name => /^\d/.test(name))
+      .map(name => path.join(cacheRoot, name))
+      .filter(candidate => {
+        try {
+          return statSync(candidate).isDirectory();
+        } catch {
+          return false;
+        }
+      })
+      .sort((a, b) => statSync(b).mtimeMs - statSync(a).mtimeMs)
+      .map(candidateWorkerScriptPath);
+  } catch {
+    return [];
+  }
+}
+
 /**
- * Canonical worker-script resolver: the marketplace install first, then the
- * dev-tree copy under cwd. Exported so other launchers (e.g. the MCP server)
- * prefer the same marketplace copy instead of spawning a stale cache-dir
- * bundle.
+ * Canonical worker-script resolver. The opt-in override exists for local
+ * testing; otherwise mirror the host hook resolver's cache-before-marketplace
+ * order so cache, marketplace, MCP, and worker restart launches converge on a
+ * single worker identity.
  */
 export function resolveWorkerScriptPath(): string | null {
+  const override = process.env.CLAUDE_MEM_WORKER_SCRIPT_PATH?.trim();
+  if (override) {
+    if (existsSync(override)) return override;
+    logger.debug('SYSTEM', 'Ignoring missing CLAUDE_MEM_WORKER_SCRIPT_PATH override', { override });
+  }
+
   const candidates = [
-    path.join(MARKETPLACE_ROOT, 'plugin', 'scripts', 'worker-service.cjs'),
+    ...cacheWorkerScriptCandidates(),
+    candidateWorkerScriptPath(path.join(MARKETPLACE_ROOT, 'plugin')),
     path.join(process.cwd(), 'plugin', 'scripts', 'worker-service.cjs'),
   ];
   for (const candidate of candidates) {
@@ -253,7 +293,9 @@ async function waitForWorkerReadiness(timeoutMs: number = HOOK_READINESS_TIMEOUT
   if (timeoutMs <= 0) {
     try {
       return await isWorkerReady();
-    } catch {
+    } catch (error: unknown) {
+      const err = error instanceof Error ? error : new Error(String(error));
+      logger.debug('SYSTEM', 'Worker readiness check threw', {}, err);
       return false;
     }
   }
@@ -286,7 +328,9 @@ async function fetchWorkerHealthVersion(): Promise<string | null> {
     const response = await workerHttpRequest('/api/health', { timeoutMs: HEALTH_CHECK_TIMEOUT_MS });
     const body = await response.json() as { version?: unknown };
     return typeof body.version === 'string' ? body.version : null;
-  } catch {
+  } catch (error: unknown) {
+    const err = error instanceof Error ? error : new Error(String(error));
+    logger.debug('SYSTEM', 'Worker health-version fetch failed', {}, err);
     return null;
   }
 }
@@ -382,11 +426,21 @@ export async function ensureWorkerRunning(): Promise<boolean> {
       pluginVersion,
       workerVersion,
     });
+    // Only the restart POST itself can throw here (the waits below swallow
+    // their own probe errors); on failure skip the successor wait and fall
+    // through to lazy-spawn.
+    let restartRequested = false;
     try {
       await workerHttpRequest('/api/admin/restart', {
         method: 'POST',
         timeoutMs: HEALTH_CHECK_TIMEOUT_MS,
       });
+      restartRequested = true;
+    } catch (error: unknown) {
+      const err = error instanceof Error ? error : new Error(String(error));
+      logger.debug('SYSTEM', 'Worker restart request failed; falling through to lazy-spawn', {}, err);
+    }
+    if (restartRequested) {
       // Do NOT lazy-spawn immediately after the POST — the old worker is
       // still dying and owns the port, so a spawn here races the corpse (the
       // observed restart ping-pong). The dying worker spawns its own
@@ -408,10 +462,6 @@ export async function ensureWorkerRunning(): Promise<boolean> {
       logger.warn('SYSTEM', 'No successor worker appeared after recycle; falling through to lazy-spawn', {
         pluginVersion,
         workerVersion,
-      });
-    } catch (error: unknown) {
-      logger.debug('SYSTEM', 'Worker restart request failed; falling through to lazy-spawn', {
-        error: error instanceof Error ? error.message : String(error),
       });
     }
     // Fall through to (re)spawn + readiness wait below.
@@ -512,7 +562,7 @@ async function waitForPidfilePort(timeoutMs: number): Promise<number | null> {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
     const info = readPidFile();
-    if (info && typeof info.port === 'number' && info.port > 0 && typeof info.pid === 'number' && isProcessAlive(info.pid)) {
+    if (info && typeof info.port === 'number' && info.port > 0 && typeof info.pid === 'number' && isPidAlive(info.pid)) {
       return info.port;
     }
     await new Promise(resolve => setTimeout(resolve, 250));
@@ -543,19 +593,26 @@ function getHookFailuresPath(): string {
   return path.join(getStateDir(), 'hook-failures.json');
 }
 
+function parseHookFailureState(raw: string): HookFailureState {
+  const parsed = JSON.parse(raw) as Partial<HookFailureState>;
+  return {
+    consecutiveFailures: typeof parsed.consecutiveFailures === 'number' && Number.isFinite(parsed.consecutiveFailures)
+      ? Math.max(0, Math.floor(parsed.consecutiveFailures))
+      : 0,
+    lastFailureAt: typeof parsed.lastFailureAt === 'number' && Number.isFinite(parsed.lastFailureAt)
+      ? parsed.lastFailureAt
+      : 0,
+  };
+}
+
 function readHookFailureState(): HookFailureState {
   try {
-    const raw = readFileSync(getHookFailuresPath(), 'utf-8');
-    const parsed = JSON.parse(raw) as Partial<HookFailureState>;
-    return {
-      consecutiveFailures: typeof parsed.consecutiveFailures === 'number' && Number.isFinite(parsed.consecutiveFailures)
-        ? Math.max(0, Math.floor(parsed.consecutiveFailures))
-        : 0,
-      lastFailureAt: typeof parsed.lastFailureAt === 'number' && Number.isFinite(parsed.lastFailureAt)
-        ? parsed.lastFailureAt
-        : 0,
-    };
+    return parseHookFailureState(readFileSync(getHookFailuresPath(), 'utf-8'));
   } catch {
+    // [ANTI-PATTERN IGNORED]: the failure-counter state file is optional and
+    // absent (ENOENT) on every hook run until the first worker failure, so
+    // logging here would fire on effectively every healthy invocation; the
+    // recovery is the zeroed default state below.
     return { consecutiveFailures: 0, lastFailureAt: 0 };
   }
 }
@@ -726,6 +783,9 @@ export async function executeWithWorkerFallback<T = unknown>(
   try {
     return JSON.parse(text) as T;
   } catch {
+    // [ANTI-PATTERN IGNORED]: worker responses are not guaranteed to be JSON;
+    // a non-JSON body is an expected shape and the raw text is the correct
+    // result for the caller.
     return text as unknown as T;
   }
 }

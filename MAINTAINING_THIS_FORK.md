@@ -35,6 +35,23 @@ bring the fork forward without re-introducing already-fixed bugs.
   pidfile discovery — ledger bug B1 recurred 2026-07-11 as a direct result). Also fixes B1
   itself: the daemon duplicate gate now health-probes before refusing, so a dead-PID ghost
   LISTEN socket no longer blocks startup (it is walked past instead).
+- `v13.10.2-fork.2` — dependency-maintenance release on `stable-v13.10.2` (2026-07-12).
+  In-range refresh of the full tree via `bun update` (notably `@anthropic-ai/claude-agent-sdk`
+  `^0.3.172` -> `^0.3.207`, `bullmq` 5.80.2, `better-auth` 1.6.23, `dompurify` 3.4.12,
+  `esbuild` 0.28.1, `shell-quote` 1.10.0 root + plugin, `tree-sitter-cli` 0.26.10,
+  `@types/node` ^26 major). Security: `hono` forced to 4.12.29 via a new `overrides`
+  entry (`^4.12.21` floor) — clears 1 high + 8 moderate advisories in the
+  `@modelcontextprotocol/sdk › @hono/node-server › hono` chain that is esbuild-inlined
+  into the shipped worker/mcp bundles. Known-accepted exposures (no in-range fix,
+  dev-only, nothing ships): `tsup › bundle-require › esbuild@0.27.x` (low, GHSA-g7r4-m6w7-qqqr,
+  tsup pins `^0.27.0`) and `np › cosmiconfig › js-yaml@4.1.1` (moderate DoS,
+  GHSA-h67p-54hq-rp68, fix is the 5.x major). Deferred major: `typescript` 7.0.2
+  (TS7 removed `moduleResolution=node10`, which upstream `tsconfig.json` still uses —
+  migration is upstream's; fork stays on `^6.0.3`). Gates: `tsc --noEmit` 0 errors,
+  build clean, 7/7 hooks `sh -n`, KEEP literals verified, segmented `bun test`
+  worker+sdk equal to the pre-refresh baseline (only the known environmental
+  worker-spawn status failure; CORS one-offs characterized as port-race flakes,
+  0/8 failures in isolated repeats).
 - Older: `stable` (base v13.3.0), `mac-sh-hook-wrapper-2026-05-28` (v13.3.0 + the old
   Mac wrap), tag `v13.3.1-fork.2`, and `rollback/2026-06-11-pre-v13.5.5-rebase`
   (pre-rebase rollback point). Do not delete; they are the rollback record.

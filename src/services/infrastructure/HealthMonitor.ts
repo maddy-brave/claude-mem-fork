@@ -1,10 +1,8 @@
 
-import path from 'path';
 import net from 'net';
-import { readFileSync } from 'fs';
 import { logger } from '../../utils/logger.js';
 import { SettingsDefaultsManager } from '../../shared/SettingsDefaultsManager.js';
-import { MARKETPLACE_ROOT, USER_SETTINGS_PATH } from '../../shared/paths.js';
+import { USER_SETTINGS_PATH } from '../../shared/paths.js';
 
 function getWorkerHost(): string {
   return SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH).CLAUDE_MEM_WORKER_HOST;
@@ -40,6 +38,17 @@ async function httpRequestToWorker(
 // Bind-probe is the only reliable cross-platform check. Host defaults to the
 // configured worker host (upstream v13.10.1 semantics) so the probe binds where
 // the worker would bind.
+//
+// v13.12.4 note: upstream's own `11518bc0` ("fix: Windows isPortInUse returns
+// false for zombie-held ports") now falls through from the HTTP fast path to a
+// net.createServer() bind probe on win32, closing the exact false-negative gap
+// this comment used to describe as unfixed upstream. Kept anyway (not dropped
+// as superseded): the fork signature carries a `host` parameter every call
+// site here and in worker-utils.ts depends on (`isPortInUse(configuredPort,
+// host)`), upstream's replacement dropped that parameter, and the fork's
+// always-bind-probe (no win32 HTTP fast path) avoids the added HTTP
+// round-trip/hang-on-fetch latency entirely rather than only on the unhappy
+// path. No regression from keeping this; see MAINTAINING_THIS_FORK.md FC-1.
 export async function isPortInUse(port: number, host: string = getWorkerHost()): Promise<boolean> {
   return new Promise((resolve) => {
     const server = net.createServer();
@@ -115,24 +124,6 @@ export async function httpShutdown(port: number, reason: 'stop' | 'restart' = 's
   }
 }
 
-export function getInstalledPluginVersion(): string {
-  try {
-    const packageJsonPath = path.join(MARKETPLACE_ROOT, 'package.json');
-    const packageJson = JSON.parse(readFileSync(packageJsonPath, 'utf-8'));
-    return packageJson.version;
-  } catch (error: unknown) {
-    if (error instanceof Error) {
-      const code = (error as NodeJS.ErrnoException).code;
-      if (code === 'ENOENT' || code === 'EBUSY') {
-        logger.debug('SYSTEM', 'Could not read plugin version (shutdown race)', { code });
-        return 'unknown';
-      }
-      throw error;
-    }
-    throw error;
-  }
-}
-
 export async function getRunningWorkerVersion(port: number): Promise<string | null> {
   try {
     const result = await httpRequestToWorker(port, '/api/health');
@@ -151,8 +142,15 @@ export interface VersionCheckResult {
   workerVersion: string | null;
 }
 
-export async function checkVersionMatch(port: number): Promise<VersionCheckResult> {
-  const pluginVersion = getInstalledPluginVersion();
+/**
+ * Compare the live worker's self-reported version against expectedVersion —
+ * the version of the script the caller's resolveWorkerScript() oracle would
+ * spawn. The caller supplies it so detection and respawn can never consult
+ * different oracles (the 2026-07-22 restart storm). Either side unknown →
+ * matches, since a recycle could not change the outcome deterministically.
+ */
+export async function checkVersionMatch(port: number, expectedVersion: string | null): Promise<VersionCheckResult> {
+  const pluginVersion = expectedVersion ?? 'unknown';
   const workerVersion = await getRunningWorkerVersion(port);
 
   if (!workerVersion || pluginVersion === 'unknown') {

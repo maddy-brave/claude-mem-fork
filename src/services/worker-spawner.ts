@@ -17,6 +17,7 @@ import {
   waitForReadiness,
 } from './infrastructure/HealthMonitor.js';
 import { acquireSpawnLock, releaseSpawnLock } from '../shared/worker-spawn-gate.js';
+import { isPidAlive } from '../supervisor/process-registry.js';
 
 const WINDOWS_SPAWN_COOLDOWN_MS = 2 * 60 * 1000;
 
@@ -89,14 +90,19 @@ export async function ensureWorkerStarted(
   const pidFileStatus = cleanStalePidFile();
   if (pidFileStatus === 'alive') {
     logger.info('SYSTEM', 'Worker PID file points to a live process, skipping duplicate spawn');
-    const healthy = await waitForHealth(port, getPlatformTimeout(HOOK_TIMEOUTS.PORT_IN_USE_WAIT));
-    if (healthy) {
+    const ready = await waitForReadiness(port, getPlatformTimeout(HOOK_TIMEOUTS.READINESS_WAIT));
+    if (ready) {
       clearWorkerSpawnAttempted();
-      const ready = await waitForReadiness(port, getPlatformTimeout(HOOK_TIMEOUTS.READINESS_WAIT));
-      logger.info('SYSTEM', 'Worker became healthy while waiting on live PID');
-      return ready ? 'ready' : 'warming';
+      logger.info('SYSTEM', 'Worker became ready while waiting on live PID');
+      return 'ready';
     }
-    logger.warn('SYSTEM', 'Live PID detected but worker did not become healthy before timeout — likely still starting');
+    const workerStillHealthy = await waitForHealth(port, 1000);
+    const workerPidStillAlive = cleanStalePidFile() === 'alive';
+    if (!workerStillHealthy && !workerPidStillAlive) {
+      logger.error('SYSTEM', 'Live PID disappeared before readiness endpoint became available');
+      return 'dead';
+    }
+    logger.warn('SYSTEM', 'Live PID detected but worker did not become ready before timeout');
     return 'warming';
   }
 
@@ -128,14 +134,21 @@ export async function ensureWorkerStarted(
     return 'dead';
   }
 
+  // Spawn gate (src/shared/worker-spawn-gate.ts): only ONE gated launcher —
+  // hook, MCP server, or the CLI restart fallback — may spawn at a time. (The
+  // dying worker's restart handoff in worker-shutdown.ts is deliberately NOT
+  // gated: it is the primary spawner on restart, and hooks wait for its
+  // successor.) Losing the lock never fails this path; the loser skips its
+  // spawn and waits for the holder's worker. The winner holds the lock through
+  // the readiness wait and releases it in finally on every exit path.
   const spawnLockHeld = acquireSpawnLock();
-  let boundPort: number | null = null;
+  let spawnedPid: number | undefined;
   try {
     if (spawnLockHeld) {
       logger.info('SYSTEM', 'Starting worker daemon', { workerScriptPath, configuredPort: port });
       markWorkerSpawnAttempted();
-      const pid = spawnDaemon(workerScriptPath, port);
-      if (pid === undefined) {
+      spawnedPid = spawnDaemon(workerScriptPath, port);
+      if (spawnedPid === undefined) {
         logger.error('SYSTEM', 'Failed to spawn worker daemon');
         return 'dead';
       }
@@ -147,35 +160,42 @@ export async function ensureWorkerStarted(
     // port (fork: pidfile-authoritative discovery — the worker self-walks past
     // phantom listeners). Wait for the pidfile to appear, then poll its actual
     // port for health/readiness rather than the configured port.
-    boundPort = await waitForPidfilePort(getPlatformTimeout(HOOK_TIMEOUTS.POST_SPAWN_WAIT));
+    const boundPort = await waitForPidfilePort(getPlatformTimeout(HOOK_TIMEOUTS.POST_SPAWN_WAIT));
+    if (boundPort === null) {
+      logger.warn('SYSTEM', 'Worker spawned but pidfile did not appear with a bound port — likely still starting in background');
+      return 'warming';
+    }
+    if (boundPort !== port) {
+      logger.info('SYSTEM', 'Worker bound fallback port', { configured: port, bound: boundPort });
+    }
+
+    const ready = await waitForReadiness(boundPort, getPlatformTimeout(HOOK_TIMEOUTS.READINESS_WAIT));
+    if (!ready) {
+      const workerStillHealthy = await waitForHealth(boundPort, 1000);
+      const workerPidStillAlive = cleanStalePidFile() === 'alive';
+      const spawnedProcessStillAlive = spawnedPid !== undefined && spawnedPid > 0 && isPidAlive(spawnedPid);
+      if (!workerStillHealthy && !workerPidStillAlive && !spawnedProcessStillAlive) {
+        logger.error('SYSTEM', spawnLockHeld
+          ? 'Worker exited before readiness endpoint became available'
+          : 'Spawn-lock holder never produced a live worker before readiness timed out');
+        return 'dead';
+      }
+      logger.warn('SYSTEM', spawnLockHeld
+        ? 'Worker spawned but readiness endpoint not responding within window'
+        : 'Spawn-lock holder\'s worker not ready within window');
+      return 'warming';
+    }
+    clearWorkerSpawnAttempted();
+    // touchPidFile is existsSync-guarded and merely refreshes the live worker's
+    // pid-file mtime — correct for lock losers too, since the worker IS up.
+    touchPidFile();
+    logger.info('SYSTEM', spawnLockHeld
+      ? 'Worker started successfully'
+      : 'Worker is up (started by another launcher)', { port: boundPort });
+    return 'ready';
   } finally {
     if (spawnLockHeld) releaseSpawnLock();
   }
-  if (boundPort === null) {
-    logger.warn('SYSTEM', 'Worker spawned but pidfile did not appear with a bound port — likely still starting in background');
-    return 'warming';
-  }
-  if (boundPort !== port) {
-    logger.info('SYSTEM', 'Worker bound fallback port', { configured: port, bound: boundPort });
-  }
-
-  const healthy = await waitForHealth(boundPort, getPlatformTimeout(HOOK_TIMEOUTS.POST_SPAWN_WAIT));
-  if (!healthy) {
-    logger.warn('SYSTEM', 'Worker spawned but health endpoint not responding within window — likely still starting in background');
-    return 'warming';
-  }
-
-  const ready = await waitForReadiness(boundPort, getPlatformTimeout(HOOK_TIMEOUTS.READINESS_WAIT));
-  if (!ready) {
-    logger.warn('SYSTEM', 'Worker is alive but readiness timed out — proceeding anyway');
-  }
-
-  clearWorkerSpawnAttempted();
-  // touchPidFile is existsSync-guarded and merely refreshes the live worker's
-  // pid-file mtime — correct for lock losers too, since the worker IS up.
-  touchPidFile();
-  logger.info('SYSTEM', 'Worker started successfully', { port: boundPort });
-  return ready ? 'ready' : 'warming';
 }
 
 async function waitForPidfilePort(timeoutMs: number): Promise<number | null> {

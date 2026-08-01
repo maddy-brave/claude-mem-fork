@@ -7,6 +7,7 @@ import { SettingsDefaultsManager, type SettingsDefaults } from "./SettingsDefaul
 import { MARKETPLACE_ROOT, DATA_DIR } from "./paths.js";
 import { loadFromFileOnce } from "./hook-settings.js";
 import { validateWorkerPidFile, readOwnedWorkerPidInfo } from "../supervisor/index.js";
+import { sanitizeEnv } from "../supervisor/env-sanitizer.js";
 import { isPortInUse } from "../services/infrastructure/HealthMonitor.js";
 import { readPidFile } from "../services/infrastructure/ProcessManager.js";
 // Upstream v13.10.x removed ProcessManager.isProcessAlive; isPidAlive is its
@@ -598,11 +599,16 @@ export async function ensureWorkerRunning(): Promise<boolean> {
         const proc = spawnHidden(runtimePath, [scriptPath, '--daemon'], {
           detached: true,
           stdio: ['ignore', 'ignore', 'ignore'],
-          env: {
+          // sanitizeEnv strips CLAUDE_CODE_*/CLAUDECODE_* so the detached worker
+          // does not inherit the parent Claude Code session's env, per the
+          // spawn-env discipline every other spawn site in src/ follows. The
+          // fork's own CLAUDE_MEM_* injection is unaffected: the sanitizer only
+          // filters those two prefixes plus four exact keys.
+          env: sanitizeEnv({
             ...process.env,
             CLAUDE_MEM_DATA_DIR: SettingsDefaultsManager.get('CLAUDE_MEM_DATA_DIR'),
             CLAUDE_MEM_WORKER_PORT: String(configuredPort),
-          },
+          }),
         });
         proc.unref();
       } catch (error: unknown) {

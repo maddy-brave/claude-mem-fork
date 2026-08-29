@@ -91,7 +91,13 @@ export async function runShutdownSequence(options: ShutdownSequenceOptions): Pro
   let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
   const deadline = new Promise<'deadline'>((resolve) => {
     deadlineTimer = setTimeout(() => resolve('deadline'), options.gracefulDeadlineMs);
-    deadlineTimer.unref?.();
+    // No unref() here. On bun 1.3.13 on Windows, an unref'd timer raced via
+    // Promise.race against a still-pending promise never fires its callback,
+    // which makes this hard deadline INERT IN PRODUCTION on that runtime, not
+    // merely in tests — exactly the "unbounded session drain" this deadline
+    // exists to prevent. The finally block below always runs
+    // clearTimeout(deadlineTimer) once the race settles, so this timer can
+    // never hold the event loop open on its own; dropping unref is safe.
   });
   try {
     const outcome = await Promise.race([

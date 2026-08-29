@@ -69,11 +69,14 @@ describe('Stale AbortController Guard (#1099)', () => {
   describe('AbortSignal.timeout for deleteSession', () => {
     it('should resolve timeout signal after specified ms', async () => {
       const start = Date.now();
-      const timeoutMs = 50; 
+      const timeoutMs = 50;
 
-      await new Promise<void>(resolve => {
-        AbortSignal.timeout(timeoutMs).addEventListener('abort', () => resolve(), { once: true });
-      });
+      // Poll .aborted instead of awaiting the 'abort' event: on bun 1.3.13 on
+      // Windows the event is never dispatched even though .aborted flips on
+      // schedule, which hangs this test forever if left as an event await.
+      // Do not "simplify" this back to addEventListener('abort', ...).
+      const signal = AbortSignal.timeout(timeoutMs);
+      while (!signal.aborted) { await Bun.sleep(5); }
 
       const elapsed = Date.now() - start;
       expect(elapsed).toBeGreaterThanOrEqual(timeoutMs - 10);
@@ -83,9 +86,15 @@ describe('Stale AbortController Guard (#1099)', () => {
       const hungGenerator = new Promise<void>(() => {});
       const timeoutMs = 50;
 
-      const timeoutDone = new Promise<string>(resolve => {
-        AbortSignal.timeout(timeoutMs).addEventListener('abort', () => resolve('timeout'), { once: true });
-      });
+      // Poll .aborted instead of awaiting the 'abort' event: on bun 1.3.13 on
+      // Windows the event is never dispatched even though .aborted flips on
+      // schedule, which hangs this test forever if left as an event await.
+      // Do not "simplify" this back to addEventListener('abort', ...).
+      const signal = AbortSignal.timeout(timeoutMs);
+      const timeoutDone = (async () => {
+        while (!signal.aborted) { await Bun.sleep(5); }
+        return 'timeout';
+      })();
 
       const generatorDone = hungGenerator.then(() => 'generator');
 

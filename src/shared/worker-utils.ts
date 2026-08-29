@@ -4,7 +4,7 @@ import { spawnHidden } from "./spawn.js";
 import { logger } from "../utils/logger.js";
 import { HOOK_TIMEOUTS, getTimeout } from "./hook-constants.js";
 import { SettingsDefaultsManager, type SettingsDefaults } from "./SettingsDefaultsManager.js";
-import { MARKETPLACE_ROOT, DATA_DIR } from "./paths.js";
+import { MARKETPLACE_ROOT, DATA_DIR, CLAUDE_CONFIG_DIR } from "./paths.js";
 import { loadFromFileOnce } from "./hook-settings.js";
 import { validateWorkerPidFile, readOwnedWorkerPidInfo } from "../supervisor/index.js";
 import { sanitizeEnv } from "../supervisor/env-sanitizer.js";
@@ -450,6 +450,68 @@ async function warnIfVersionStillMismatched(expectedPluginVersion: string): Prom
   }
 }
 
+/**
+ * Read the worker-script path the live worker was actually launched from,
+ * from GET /api/health (Server.ts sets workerPath: __filename). Used by the
+ * cross-profile identity check below. Returns null when the worker is
+ * unreachable or the payload is malformed.
+ */
+async function fetchWorkerHealthWorkerPath(): Promise<string | null> {
+  try {
+    const response = await workerHttpRequest('/api/health', { timeoutMs: HEALTH_CHECK_TIMEOUT_MS });
+    const body = await response.json() as { workerPath?: unknown };
+    return typeof body.workerPath === 'string' ? body.workerPath : null;
+  } catch (error: unknown) {
+    const err = error instanceof Error ? error : new Error(String(error));
+    logger.debug('SYSTEM', 'Worker health-path fetch failed', {}, err);
+    return null;
+  }
+}
+
+/**
+ * Best-effort recovery of the CLAUDE_CONFIG_DIR a worker-script path implies,
+ * by stripping the known cache-install suffix
+ * (plugins/cache/thedotmack/claude-mem/<version>/plugin/scripts/...). Returns
+ * null for marketplace- or cwd-resolved paths, which do not encode a profile
+ * root the same way; callers fall back to logging the raw path in that case.
+ */
+function deriveConfigDirFromWorkerPath(workerPath: string): string | null {
+  const marker = path.sep + path.join('plugins', 'cache', 'thedotmack', 'claude-mem') + path.sep;
+  const idx = workerPath.indexOf(marker);
+  if (idx === -1) return null;
+  return workerPath.slice(0, idx);
+}
+
+/**
+ * Cross-profile identity check for the ATTACH path only.
+ *
+ * claude-mem's worker is a deliberate cross-profile SINGLETON: one shared
+ * CLAUDE_MEM_DATA_DIR, one pidfile, one port, used by every Claude Code
+ * profile. resolveWorkerScript() resolves the worker-script candidate THIS
+ * profile's CLAUDE_CONFIG_DIR would spawn; the already-running worker
+ * reports the script path it was actually launched from via workerPath on
+ * /api/health. When the two diverge, this profile is silently attaching to
+ * a worker that froze a DIFFERENT profile's environment (plugin code path,
+ * and every environment-derived credential input) for the worker's whole
+ * lifetime.
+ *
+ * DETECT AND SURFACE ONLY, by operator decision: five profiles share one
+ * port, so auto-respawning on mismatch would let two profiles thrash over
+ * that port, trading a silent failure for a noisy one. A loud log line
+ * naming both paths is the entire scope of this check.
+ */
+async function warnIfWorkerIdentityMismatched(expectedScriptPath: string | null): Promise<void> {
+  if (!expectedScriptPath) return;
+  const actualWorkerPath = await fetchWorkerHealthWorkerPath();
+  if (actualWorkerPath === null || actualWorkerPath === expectedScriptPath) return;
+  logger.warn('SYSTEM', 'Worker identity mismatch: attaching to a worker launched by a DIFFERENT Claude Code profile; its environment-derived credentials and plugin code path are frozen from that profile, not this one', {
+    callerConfigDir: CLAUDE_CONFIG_DIR,
+    callerExpectedWorkerPath: expectedScriptPath,
+    workerConfigDir: deriveConfigDirFromWorkerPath(actualWorkerPath) ?? '(unresolvable from workerPath)',
+    workerActualPath: actualWorkerPath,
+  });
+}
+
 async function isWorkerPortAlive(): Promise<boolean> {
   let healthy: boolean;
   try {
@@ -503,6 +565,7 @@ export async function ensureWorkerRunning(): Promise<boolean> {
       if (expectedPluginVersion !== null) {
         await warnIfVersionStillMismatched(expectedPluginVersion);
       }
+      await warnIfWorkerIdentityMismatched(resolvedScript?.scriptPath ?? null);
       return true;
     }
 

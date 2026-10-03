@@ -813,6 +813,16 @@ export async function ensureWorkerRunning(): Promise<boolean> {
   const host = getWorkerHost();
   const pidStatus = validateWorkerPidFile({ logAlive: false });
   if (pidStatus !== 'alive' && await isPortInUse(configuredPort)) {
+    // WINDOWS-FORK composition (v13.28.0 merge): an occupied port with no owned
+    // pidfile may be a WARMING worker that bound the port but has not written
+    // its pidfile yet (upstream regression guard, worker-utils-zombie-port.test).
+    // Give it upstream's short health window before treating the port as a
+    // ghost; only an unreachable port falls through to the fork's walk.
+    if (await waitForWorkerHealthyWithin(getTimeout(HOOK_TIMEOUTS.PORT_IN_USE_WAIT))) {
+      clearPortCache();
+      logger.info('SYSTEM', 'Occupied port answered health during the warm-up window — using it', { configuredPort });
+      return true;
+    }
     logger.warn(
       'SYSTEM',
       'Configured port has phantom listener — worker will walk to next available port',
@@ -901,7 +911,10 @@ export async function ensureWorkerRunning(): Promise<boolean> {
     // (~15.5s) also covers cold-boot worker spawn (#2795): a cold macOS+Chroma
     // worker can need ~7s to bind, longer than the old ~0.75s budget that raced
     // boot and soft-failed context/session-init to empty.
-    boundPort = await waitForPidfilePort(getTimeout(HOOK_TIMEOUTS.POST_SPAWN_WAIT));
+    // WINDOWS-FORK composition: accept EITHER a live pidfile (walked or
+    // configured port, pidfile-authoritative) OR a healthy configured port
+    // whose pidfile has not landed yet, whichever comes first.
+    boundPort = await waitForBoundPort(configuredPort, getTimeout(HOOK_TIMEOUTS.POST_SPAWN_WAIT));
     if (boundPort === null) {
       logger.warn('SYSTEM', spawnLockHeld
         ? 'Worker port did not open after lazy-spawn within the cold-boot wait (~15s)'
@@ -948,6 +961,41 @@ export async function ensureWorkerRunning(): Promise<boolean> {
 }
 
 // WINDOWS-FORK: pidfile-authoritative port discovery.
+// WINDOWS-FORK: poll health on the configured port for a bounded window.
+async function waitForWorkerHealthyWithin(timeoutMs: number): Promise<boolean> {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    try {
+      if (await isWorkerPortAlive()) return true;
+    } catch {
+      // unreachable: keep polling
+    }
+    await new Promise(resolve => setTimeout(resolve, 250));
+  }
+  return false;
+}
+
+// WINDOWS-FORK: bound-port discovery after a spawn. A live pidfile wins because
+// it names the port the worker actually bound, walked or not; a healthy
+// configured port whose pidfile has not been written yet is accepted too so a
+// warming worker is never mistaken for a ghost.
+async function waitForBoundPort(configuredPort: number, timeoutMs: number): Promise<number | null> {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const info = readPidFile();
+    if (info && typeof info.port === 'number' && info.port > 0 && typeof info.pid === 'number' && isPidAlive(info.pid)) {
+      return info.port;
+    }
+    try {
+      if (await isWorkerPortAlive()) return configuredPort;
+    } catch {
+      // unreachable: keep polling
+    }
+    await new Promise(resolve => setTimeout(resolve, 250));
+  }
+  return null;
+}
+
 async function waitForPidfilePort(timeoutMs: number): Promise<number | null> {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {

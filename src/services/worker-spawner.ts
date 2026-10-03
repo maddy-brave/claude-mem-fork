@@ -199,11 +199,12 @@ export async function ensureWorkerStarted(
     // port (fork: pidfile-authoritative discovery — the worker self-walks past
     // phantom listeners). Wait for the pidfile to appear, then poll its actual
     // port for health/readiness rather than the configured port.
-    const boundPort = await waitForPidfilePort(getPlatformTimeout(HOOK_TIMEOUTS.POST_SPAWN_WAIT));
-    if (boundPort === null) {
-      logger.warn('SYSTEM', 'Worker spawned but pidfile did not appear with a bound port — likely still starting in background');
-      return 'warming';
-    }
+    // Only a SHORT pidfile window: if the worker took the configured port the
+    // pidfile is not needed, and upstream's readiness wait below covers it; if
+    // it walked, the pidfile lands right after server.listen (sub-second). A
+    // missing pidfile therefore falls back to the configured port instead of
+    // returning early, so upstream's readiness and boot-failure diagnosis run.
+    const boundPort = (await waitForPidfilePort(getPlatformTimeout(PIDFILE_DISCOVERY_WAIT_MS))) ?? port;
     if (boundPort !== port) {
       logger.info('SYSTEM', 'Worker bound fallback port', { configured: port, bound: boundPort });
     }
@@ -246,6 +247,10 @@ export async function ensureWorkerStarted(
     if (spawnLockHeld) releaseSpawnLock();
   }
 }
+
+// WINDOWS-FORK: how long the spawner waits for the pidfile to reveal a walked port
+// before falling back to the configured port for upstream's readiness wait.
+const PIDFILE_DISCOVERY_WAIT_MS = 3000;
 
 async function waitForPidfilePort(timeoutMs: number): Promise<number | null> {
   const start = Date.now();

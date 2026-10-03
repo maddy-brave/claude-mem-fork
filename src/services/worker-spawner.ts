@@ -8,6 +8,7 @@ import {
   cleanStalePidFile,
   getPlatformTimeout,
   readPidFile,
+  probeWorkerBootFailure,
   spawnDaemon,
   touchPidFile,
 } from './infrastructure/ProcessManager.js';
@@ -18,6 +19,7 @@ import {
 } from './infrastructure/HealthMonitor.js';
 import { acquireSpawnLock, releaseSpawnLock } from '../shared/worker-spawn-gate.js';
 import { isPidAlive } from '../supervisor/process-registry.js';
+import { reclaimGhostListeningPort } from '../shared/port-reclaim.js';
 
 const WINDOWS_SPAWN_COOLDOWN_MS = 2 * 60 * 1000;
 
@@ -70,10 +72,23 @@ function clearWorkerSpawnAttempted(): void {
 
 export type WorkerStartResult = 'ready' | 'warming' | 'dead';
 
+// Why the last spawn died, when we could prove it. ensureWorkerStarted returns
+// a three-state verdict that callers switch on, and widening that union to
+// carry a reason would churn every call site for a string only the failure
+// branch ever has. Set immediately before returning 'dead', cleared on entry so
+// a later failure can never be explained by an earlier one's diagnosis.
+let lastWorkerBootFailure: string | undefined;
+
+export function getLastWorkerBootFailure(): string | undefined {
+  return lastWorkerBootFailure;
+}
+
 export async function ensureWorkerStarted(
   port: number,
   workerScriptPath: string
 ): Promise<WorkerStartResult> {
+  lastWorkerBootFailure = undefined;
+
   if (!workerScriptPath) {
     logger.error('SYSTEM', 'ensureWorkerStarted called with empty workerScriptPath — caller bug');
     return 'dead';
@@ -122,11 +137,35 @@ export async function ensureWorkerStarted(
   // is unhealthy and choose to recover it.
   const portInUse = await isPortInUse(port);
   if (portInUse) {
-    logger.warn(
-      'SYSTEM',
-      'Configured port has phantom listener — worker will walk to next available port',
-      { configuredPort: port, pidFileStatus }
-    );
+    logger.info('SYSTEM', 'Port in use, waiting for worker to become healthy');
+    const healthy = await waitForHealth(port, getPlatformTimeout(HOOK_TIMEOUTS.PORT_IN_USE_WAIT));
+    if (healthy) {
+      clearWorkerSpawnAttempted();
+      const ready = await waitForReadiness(port, getPlatformTimeout(HOOK_TIMEOUTS.READINESS_WAIT));
+      logger.info('SYSTEM', 'Worker is now healthy');
+      return ready ? 'ready' : 'warming';
+    }
+    // WINDOWS-FORK: reclaim first, then walk; never refuse to start on a ghost.
+    // Upstream plan-15 #3603: a dead worker's surviving chroma sidecar chain can
+    // hold the inherited listening socket. Reclaim only fires when the owner is
+    // provably dead and the survivors are chroma sidecars. If it declines, the
+    // fork warns and continues to spawn; the worker self-walks to the next port.
+    const reclaim = await reclaimGhostListeningPort(port);
+    if (reclaim.reclaimed) {
+      logger.info('SYSTEM', 'Reclaimed ghost listener left by a dead worker — proceeding to spawn', {
+        port,
+        killedPids: reclaim.killedPids,
+      });
+      // The cooldown marker may have been written by the spawn attempts this
+      // ghost blocked; the cause is gone, so clear it (evidence, not time).
+      clearWorkerSpawnAttempted();
+    } else {
+      logger.warn(
+        'SYSTEM',
+        'Configured port has phantom listener — worker will walk to next available port',
+        { configuredPort: port, pidFileStatus, reclaimReason: reclaim.reason }
+      );
+    }
   }
 
   if (shouldSkipSpawnOnWindows()) {
@@ -175,9 +214,19 @@ export async function ensureWorkerStarted(
       const workerPidStillAlive = cleanStalePidFile() === 'alive';
       const spawnedProcessStillAlive = spawnedPid !== undefined && spawnedPid > 0 && isPidAlive(spawnedPid);
       if (!workerStillHealthy && !workerPidStillAlive && !spawnedProcessStillAlive) {
-        logger.error('SYSTEM', spawnLockHeld
-          ? 'Worker exited before readiness endpoint became available'
-          : 'Spawn-lock holder never produced a live worker before readiness timed out');
+        if (!spawnLockHeld) {
+          logger.error('SYSTEM', 'Spawn-lock holder never produced a live worker before readiness timed out');
+          return 'dead';
+        }
+        // We launched it and it is gone, so the bundle itself is the suspect —
+        // and its stderr went to a hidden window. Ask it again where we can
+        // hear the answer.
+        lastWorkerBootFailure = probeWorkerBootFailure(workerScriptPath);
+        logger.error(
+          'SYSTEM',
+          'Worker exited before readiness endpoint became available',
+          lastWorkerBootFailure ? { bootFailure: lastWorkerBootFailure } : {}
+        );
         return 'dead';
       }
       logger.warn('SYSTEM', spawnLockHeld
@@ -202,7 +251,9 @@ async function waitForPidfilePort(timeoutMs: number): Promise<number | null> {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
     const info = readPidFile();
-    if (info && typeof info.port === 'number' && info.port > 0) {
+    // WINDOWS-FORK: require a live owner pid, matching the worker-utils copy, so a pidfile
+    // left by a worker that died mid-boot is never reported as the bound port.
+    if (info && typeof info.port === 'number' && info.port > 0 && typeof info.pid === 'number' && isPidAlive(info.pid)) {
       return info.port;
     }
     await new Promise(resolve => setTimeout(resolve, 250));

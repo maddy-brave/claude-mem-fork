@@ -21,16 +21,28 @@ import {
 import { sanitizeEnv } from '../../supervisor/env-sanitizer.js';
 import {
   globalRateLimitStore,
+  buildUsageLimitHitProps,
+  extractRateLimitInfo,
   shouldAbortForQuota,
-  type RateLimitInfo,
 } from './RateLimitStore.js';
 
 // @ts-ignore - Agent SDK types may not be available
 import { query } from '@anthropic-ai/claude-agent-sdk';
 import { buildHardenedSdkOptions } from '../../sdk/hardened-options.js';
 import { ClassifiedProviderError } from './provider-errors.js';
-import { resolveTierAlias } from './model-aliases.js';
+import { resolveSummaryTierModel, resolveTierAlias } from './model-aliases.js';
+import {
+  shouldRecycleConversation,
+  conversationChars,
+  resolveConversationMaxChars,
+} from '../../shared/observer-recycle.js';
+import { recycleObserverConversation, loadSessionStartContext } from './session/recycle-conversation.js';
+import { ObserverResponsePacer } from './session/response-pacer.js';
+import { IDLE_TIMEOUT_MS } from './SessionMessageBuffer.js';
+import { optimizeObservationFields, buildFieldCompressionPrompt, type FieldCompressor } from './field-optimizer.js';
+import { buildTelegramWrapupPrompt, type TelegramWrapupFormatterInput } from '../integrations/TelegramWrapupNotifier.js';
 import { telemetryBuffer } from '../telemetry/buffer.js';
+import { captureEvent } from '../telemetry/telemetry.js';
 import { clearDependencyStatus, recordClaudeCliSetupRequired } from '../../shared/dependency-health.js';
 
 /**
@@ -202,9 +214,42 @@ export class ClaudeProvider {
   private dbManager: DatabaseManager;
   private sessionManager: SessionManager;
 
+  /** Character budget for one observer generation, operator-overridable (#3800). */
+  private conversationMaxChars(): number {
+    return resolveConversationMaxChars(
+      SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH).CLAUDE_MEM_OBSERVER_MAX_CONVERSATION_CHARS
+    );
+  }
+
+  /** How long an unanswered prompt may go without SDK activity (#4066). */
+  private responseStallMs(): number {
+    return IDLE_TIMEOUT_MS;
+  }
+
   constructor(dbManager: DatabaseManager, sessionManager: SessionManager) {
     this.dbManager = dbManager;
     this.sessionManager = sessionManager;
+  }
+
+  /**
+   * Reset a carried memory_session_id before a fresh SDK spawn. Observer spawns
+   * opt out of Claude transcript persistence, so a session_id carried from an
+   * earlier no-persist spawn is not safe to feed back into `resume` on a later
+   * fresh process.
+   *
+   * Reset the in-memory ID only. Do NOT write NULL to the database: the stored
+   * ID is never read back for resumption (hasRealMemorySessionId and
+   * shouldResume in startSession are both false), and the foreign key that
+   * links observations and session_summaries carries ON UPDATE CASCADE plus a
+   * NOT NULL column. A NULL write cascades into the child rows and violates
+   * NOT NULL, which rolls back the whole storage transaction (#3628).
+   * Legitimate re-keying flows through updateMemorySessionId.
+   * ensureMemorySessionIdRegistered only fills a NULL id.
+   */
+  private resetCarriedMemorySessionId(session: ActiveSession): void {
+    if (session.memorySessionId) {
+      session.memorySessionId = null;
+    }
   }
 
   async startSession(session: ActiveSession, worker?: WorkerRef): Promise<void> {
@@ -233,14 +278,13 @@ export class ClaudeProvider {
     session.lastResultTotalCostUsd = null;
 
     const activeResponseContext = { current: snapshotResponseContext(session) };
+    const compressField: FieldCompressor = (text, budgetChars, signal) =>
+      this.compressField(text, budgetChars, session, modelId, claudePath, signal);
+    // Paces the streaming feed to one unanswered prompt per generation (#4066).
+    const pacer = new ObserverResponsePacer();
+    const messageGenerator = this.createMessageGenerator(session, cwdTracker, activeResponseContext, worker, compressField, pacer);
 
-    if (session.memorySessionId) {
-      // Observer spawns intentionally opt out of Claude transcript persistence.
-      // A carried session_id from an earlier no-persist spawn is therefore not
-      // safe to feed back into `resume` on a later fresh process.
-      this.dbManager.getSessionStore().updateMemorySessionId(session.sessionDbId, null);
-      session.memorySessionId = null;
-    }
+    this.resetCarriedMemorySessionId(session);
 
     const hasRealMemorySessionId = false;
     const shouldResume = false;
@@ -253,21 +297,21 @@ export class ClaudeProvider {
       session.forceInit = false;
     }
 
-    const settings = SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH);
-    const maxConcurrent = parseInt(settings.CLAUDE_MEM_MAX_CONCURRENT_AGENTS, 10) || 2;
     // waitForSlot reserves the slot it grants (#3287). The spawn factory
     // releases the reservation once the spawned process is a registry record;
     // the finally below covers every path where the spawn never happens
     // (OAuth failure, abort, query() throwing). release() is idempotent.
-    const slotReservation = await waitForSlot(maxConcurrent, session.abortController.signal);
-
-    // D4 (observer batch/throttle). Both default to current behavior:
-    // batchSize=1 flushes every message immediately (no coalescing);
-    // maxObservationsPerSession=0 disables the cap (never drop).
-    const observationBatchSize = parseInt(settings.CLAUDE_MEM_OBSERVATION_BATCH_SIZE, 10) || 1;
-    const maxObservationsPerSession = parseInt(settings.CLAUDE_MEM_MAX_OBSERVATIONS_PER_SESSION, 10) || 0;
-
-    const messageGenerator = this.createMessageGenerator(session, cwdTracker, activeResponseContext, observationBatchSize, maxObservationsPerSession);
+    //
+    // #2756: pass a thunk, not a frozen number — re-reads settings on every
+    // recheck so raising CLAUDE_MEM_MAX_CONCURRENT_AGENTS releases an
+    // already-parked waiter without a worker restart. sessionId lets
+    // SessionRoutes detect via isSessionParkedForSlot() whether this session
+    // is parked here (vs. mid-response) when the selected provider changes.
+    const slotReservation = await waitForSlot(
+      () => parseInt(SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH).CLAUDE_MEM_MAX_CONCURRENT_AGENTS, 10) || 2,
+      session.abortController.signal,
+      session.sessionDbId
+    );
 
     try {
       const isolatedEnv = sanitizeEnv(await buildIsolatedEnvWithFreshOAuth());
@@ -311,19 +355,53 @@ export class ClaudeProvider {
         }),
       });
 
+      // Baseline for the next dispatched response's discovery-token delta.
+      // Textless frames are not dispatched (see below), so their usage rolls
+      // into the next dispatch instead of going unattributed.
+      let discoveryTokenBaseline = session.cumulativeInputTokens + session.cumulativeOutputTokens;
+      // Whether the current turn has dispatched any text yet. A turn that ends
+      // without one still needs the idle hand-off, otherwise the claimed batch
+      // is left dangling for session teardown to discard.
+      let turnDispatchedText = false;
+      // One re-queue per generator pass for a batch a failed turn never read.
+      let retriedAfterErrorResult = false;
+
       for await (const message of queryResult) {
-        // Quota-aware wall-clock guard (#2234): the SDK pushes `system` events
-        // with subtype `rate_limit` carrying live subscription quota state.
-        // Capture the snapshot, then bail out of the loop before issuing
-        // another request if we've crossed a per-window threshold. API-key
-        // users are exempt — they authorized per-call spend.
-        if (
-          (message as any)?.type === 'system' &&
-          (message as any)?.subtype === 'rate_limit'
-        ) {
-          const info = (message as any).rate_limit_info as RateLimitInfo | undefined;
-          if (info) {
-            globalRateLimitStore.set(info);
+        // A stall already handed the claimed batch back to pending; a frame
+        // processed now would be stored twice once the batch is re-sent (#4066).
+        if (pacer.hasStalled) break;
+        // Any SDK message means the turn is alive, so the feed's stall window
+        // restarts; an announced API retry also buys its backoff delay (#4066).
+        pacer.activity(
+          message.type === 'system' && message.subtype === 'api_retry' && typeof message.retry_delay_ms === 'number'
+            ? message.retry_delay_ms
+            : 0,
+        );
+        // Quota-aware wall-clock guard (#2234): the SDK pushes
+        // `rate_limit_event` messages carrying live subscription quota state
+        // (see extractRateLimitInfo for the shape). Capture the snapshot, then
+        // bail out of the loop before issuing another request if we've
+        // crossed a per-window threshold. API-key users are exempt — they
+        // authorized per-call spend.
+        const info = extractRateLimitInfo(message);
+        if (info) {
+          // The observer runs on the same account as the observed session,
+          // so a `rejected` snapshot here means the user's own Claude Code
+          // session is out of usage too. set() dedupes: one event per
+          // exhausted window, not one per observer request against the wall.
+          if (globalRateLimitStore.set(info)) {
+            logger.warn('SDK', 'Subscription usage limit hit', {
+              sessionDbId: session.sessionDbId,
+              window: info.rateLimitType,
+              overageStatus: info.overageStatus,
+            });
+            captureEvent('usage_limit_hit', {
+              ...buildUsageLimitHitProps(info),
+              ide: session.platformSource,
+              provider: 'claude',
+              observed_model: session.observedModel,
+              observed_billing: session.observedBilling,
+            });
           }
           const decision = shouldAbortForQuota(authMethod, globalRateLimitStore);
           if (decision.abort) {
@@ -338,6 +416,22 @@ export class ClaudeProvider {
             } catch {
               // best-effort
             }
+            // WINDOWS-FORK (P5): on a provider-side hard rejection, throw
+            // instead of break so the structured rate_limit_event reaches the
+            // pool-aware catch below and rotates the OAuth token like the
+            // in-band assistant-text path does. Utilization-threshold and
+            // reset-grace decisions are NOT rejections: they keep upstream's
+            // break so a healthy pool token is not cooled and no false
+            // allExhausted marker is set. Key on the snapshot's own status
+            // fields, the same test RateLimitStore.shouldAbortForQuota applies.
+            const hardRejected =
+              info.status === 'rejected' ||
+              (decision.window === 'overage' && info.overageStatus === 'rejected');
+            if (hardRejected) {
+              throw new Error(
+                `Claude usage limit reached: rate_limit_event ${decision.window ?? 'unknown'}`,
+              );
+            }
             break;
           }
         }
@@ -345,12 +439,11 @@ export class ClaudeProvider {
         if (message.session_id && message.session_id !== session.memorySessionId) {
           const previousId = session.memorySessionId;
           session.memorySessionId = message.session_id;
-          this.dbManager.getSessionStore().ensureMemorySessionIdRegistered(
+          const registeredId = this.dbManager.getSessionStore().ensureMemorySessionIdRegistered(
             session.sessionDbId,
             message.session_id
           );
-          const verification = this.dbManager.getSessionStore().getSessionById(session.sessionDbId);
-          const dbVerified = verification?.memory_session_id === message.session_id;
+          const dbVerified = registeredId === message.session_id;
           const logMessage = previousId
             ? `MEMORY_ID_CHANGED | sessionDbId=${session.sessionDbId} | from=${previousId} | to=${message.session_id} | dbVerified=${dbVerified}`
             : `MEMORY_ID_CAPTURED | sessionDbId=${session.sessionDbId} | memorySessionId=${message.session_id} | dbVerified=${dbVerified}`;
@@ -360,7 +453,8 @@ export class ClaudeProvider {
             previousId
           });
           if (!dbVerified) {
-            logger.error('SESSION', `MEMORY_ID_MISMATCH | sessionDbId=${session.sessionDbId} | expected=${message.session_id} | got=${verification?.memory_session_id}`, {
+            // Expected on later turns: ensure keeps the first registered id.
+            logger.debug('SESSION', `Keeping the registered memory_session_id | sessionDbId=${session.sessionDbId} | registered=${registeredId} | offered=${message.session_id}`, {
               sessionId: session.sessionDbId
             });
           }
@@ -369,13 +463,24 @@ export class ClaudeProvider {
 
         if (message.type === 'assistant') {
           const content = message.message.content;
+          // A turn can arrive as several assistant messages, and a frame that
+          // holds only thinking or tool_use blocks carries no text at all.
+          // Flattening such a frame to '' and handing it to
+          // processAgentResponse makes the parser read the turn as idle and
+          // confirm-and-drop the claimed batch before the real XML frame
+          // arrives (#3492). A frame that does contain a text block still goes
+          // through even when that text is empty: that is the provider saying
+          // it had nothing to record, which stays a confirmed no-op batch. A
+          // turn that never produces a text frame gets the same idle hand-off
+          // once, from the `result` branch below.
+          const hasTextBlock = Array.isArray(content)
+            ? content.some((c: any) => c?.type === 'text')
+            : typeof content === 'string';
           const textContent = Array.isArray(content)
             ? content.filter((c: any) => c.type === 'text').map((c: any) => c.text).join('\n')
             : typeof content === 'string' ? content : '';
 
           const responseSize = textContent.length;
-
-          const tokensBeforeResponse = session.cumulativeInputTokens + session.cumulativeOutputTokens;
 
           const usage = message.message.usage;
           if (usage) {
@@ -406,7 +511,18 @@ export class ClaudeProvider {
             });
           }
 
-          const discoveryTokens = (session.cumulativeInputTokens + session.cumulativeOutputTokens) - tokensBeforeResponse;
+          if (!hasTextBlock) {
+            logger.debug('SDK', 'Assistant frame carried no text block, leaving queued batch intact', {
+              sessionId: session.sessionDbId,
+              promptNumber: session.lastPromptNumber,
+              blockTypes: Array.isArray(content)
+                ? [...new Set(content.map((c: any) => String(c?.type)))].join(',')
+                : typeof content,
+            });
+            continue;
+          }
+
+          const discoveryTokens = (session.cumulativeInputTokens + session.cumulativeOutputTokens) - discoveryTokenBaseline;
 
           const originalTimestamp = session.earliestPendingTimestamp;
 
@@ -453,6 +569,9 @@ export class ClaudeProvider {
             modelId,
             activeResponseContext.current
           );
+
+          discoveryTokenBaseline = session.cumulativeInputTokens + session.cumulativeOutputTokens;
+          turnDispatchedText = true;
         }
 
         if (message.type === 'result') {
@@ -498,6 +617,52 @@ export class ClaudeProvider {
                   : undefined,
             });
           }
+
+          const resultSubtype = (message as any).subtype as string | undefined;
+          const resultIsError = (message as any).is_error === true || resultSubtype !== 'success';
+
+          // The turn is over and the model never emitted text. Only a
+          // successful turn means "the model read the batch and chose to skip
+          // it" — forward the empty response once so the claim is acknowledged
+          // instead of being retried forever. A failed turn never reached that
+          // judgement, so its batch goes back to the buffer for the drain to
+          // re-yield. Exactly one such retry per generator pass: a message is
+          // always pending while a batch is re-queued, so the buffer never
+          // idles out, and an endlessly failing turn would spin on it.
+          if (!turnDispatchedText) {
+            if (resultIsError && !retriedAfterErrorResult) {
+              retriedAfterErrorResult = true;
+              logger.warn('SDK', 'SDK turn failed before emitting text, re-queueing the claimed batch', {
+                sessionId: session.sessionDbId,
+                subtype: resultSubtype,
+              });
+              await this.sessionManager.resetProcessingToPending(session.sessionDbId);
+            } else {
+              await processAgentResponse(
+                '',
+                session,
+                this.dbManager,
+                this.sessionManager,
+                worker,
+                (session.cumulativeInputTokens + session.cumulativeOutputTokens) - discoveryTokenBaseline,
+                session.earliestPendingTimestamp,
+                'SDK',
+                cwdTracker.lastCwd,
+                modelId,
+                activeResponseContext.current
+              );
+              discoveryTokenBaseline = session.cumulativeInputTokens + session.cumulativeOutputTokens;
+            }
+          }
+          if (!resultIsError) {
+            retriedAfterErrorResult = false;
+          }
+          turnDispatchedText = false;
+          // The result frame is the one turn boundary every outcome passes
+          // through — XML, empty/prose, and the failed-turn re-queue above,
+          // which never reaches processAgentResponse. Opening the feed per text
+          // frame instead would let a multi-frame turn release it early (#4066).
+          pacer.answer();
         }
       }
     } catch (err) {
@@ -590,6 +755,9 @@ export class ClaudeProvider {
       }
       throw err;
     } finally {
+      // Whatever ended the stream (throw, quota break, abort), nothing will
+      // answer the feed's last prompt any more.
+      pacer.close();
       // Safety net for paths where the SDK never invoked the spawn factory;
       // a leaked reservation would occupy an agent slot until worker restart.
       slotReservation.release();
@@ -613,12 +781,114 @@ export class ClaudeProvider {
     });
   }
 
+  /** One bounded, standalone SDK call on the same Observer provider path. */
+  private async runStandaloneObserverPrompt(
+    prompt: string,
+    context: {
+      sessionDbId: number;
+      contentSessionId: string;
+      project: string;
+      signals?: AbortSignal[];
+    },
+    modelId: string,
+    claudePath: string,
+  ): Promise<string | null> {
+    const isolatedEnv = sanitizeEnv(await buildIsolatedEnvWithFreshOAuth());
+    const controller = new AbortController();
+    const abort = () => controller.abort();
+    const signals = context.signals ?? [];
+    for (const source of signals) {
+      source.addEventListener('abort', abort, { once: true });
+      if (source.aborted) abort();
+    }
+    try {
+      if (controller.signal.aborted) return null;
+      const result = query({
+        prompt,
+        options: {
+          ...buildHardenedSdkOptions({
+            source: 'Observer',
+            sessionDbId: context.sessionDbId,
+            contentSessionId: context.contentSessionId,
+            project: context.project,
+            model: modelId,
+            env: isolatedEnv,
+            pathToClaudeCodeExecutable: claudePath,
+            abortController: controller,
+          }),
+          maxTurns: 1,
+        },
+      });
+
+      let out = '';
+      for await (const message of result) {
+        if (message.type === 'assistant') {
+          const content = (message as any).message.content;
+          out += Array.isArray(content)
+            ? content.filter((c: any) => c.type === 'text').map((c: any) => c.text).join('\n')
+            : typeof content === 'string' ? content : '';
+        }
+      }
+      return out || null;
+    } finally {
+      for (const source of signals) source.removeEventListener('abort', abort);
+    }
+  }
+
+  private async compressField(
+    text: string,
+    budgetChars: number,
+    session: ActiveSession,
+    modelId: string,
+    claudePath: string,
+    signal: AbortSignal,
+  ): Promise<string | null> {
+    return this.runStandaloneObserverPrompt(
+      buildFieldCompressionPrompt(text, budgetChars),
+      {
+        sessionDbId: session.sessionDbId,
+        contentSessionId: session.contentSessionId,
+        project: session.project,
+        signals: [signal, session.abortController.signal],
+      },
+      modelId,
+      claudePath,
+    );
+  }
+
+  /** Format a stored summary through the same hardened Claude SDK path as summaries. */
+  async formatTelegramWrapup(
+    input: TelegramWrapupFormatterInput,
+    activeModelId?: string,
+  ): Promise<string> {
+    const claudePath = findClaudeExecutable('SDK');
+    const modelId = activeModelId ?? this.getSummaryModelId();
+    const text = await this.runStandaloneObserverPrompt(
+      buildTelegramWrapupPrompt(input.summaryText),
+      input,
+      modelId,
+      claudePath,
+    );
+    if (!text?.trim()) {
+      const error = new Error('Claude returned no text for the Telegram wrap-up');
+      logger.error('TELEGRAM', error.message, { sessionId: input.sessionDbId, model: modelId }, error);
+      throw error;
+    }
+    return text;
+  }
+
   private async *createMessageGenerator(
     session: ActiveSession,
     cwdTracker: { lastCwd: string | undefined },
     activeResponseContext: { current: ReturnType<typeof snapshotResponseContext> },
-    observationBatchSize: number = 1,
-    maxObservationsPerSession: number = 0
+    worker?: WorkerRef,
+    compressField?: FieldCompressor,
+    pacer: ObserverResponsePacer = new ObserverResponsePacer(),
+    // D4 — observer batch/throttle. Defaults read from settings so upstream's
+    // call site (which passes only the first six args) keeps working.
+    // batchSize=1 flushes every message (no coalescing); cap=0 never drops.
+    observationBatchSize: number = parseInt(SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH).CLAUDE_MEM_OBSERVATION_BATCH_SIZE, 10) || 1,
+    maxObservationsPerSession: number = parseInt(SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH).CLAUDE_MEM_MAX_OBSERVATIONS_PER_SESSION, 10) || 0,
   ): AsyncIterableIterator<SDKUserMessage> {
     const mode = ModeManager.getInstance().getActiveMode();
 
@@ -631,15 +901,26 @@ export class ClaudeProvider {
       promptType: isInitPrompt ? 'INIT' : 'CONTINUATION'
     });
 
+    // Release claims a previous generation left unconfirmed (a quota-guard
+    // abort does not reset them) BEFORE the init prompt goes out. The iterator
+    // resets them too, but only once the init reply has been awaited — and that
+    // reply would otherwise confirm the stale claim unanswered (#4066).
+    await this.sessionManager.resetProcessingToPending(session.sessionDbId);
+
+    // Brief the generation with the same session-start context a new Claude Code
+    // session gets, so a conversation that starts partway through continues from
+    // the memory rather than from nothing (#3800).
+    const priorContext = await loadSessionStartContext(session, cwdTracker.lastCwd);
     const initPrompt = isInitPrompt
-      ? buildInitPrompt(session.project, session.contentSessionId, session.userPrompt, mode)
-      : buildContinuationPrompt(session.userPrompt, session.lastPromptNumber, session.contentSessionId, mode);
+      ? buildInitPrompt(session.project, session.contentSessionId, session.userPrompt, mode, priorContext)
+      : buildContinuationPrompt(session.userPrompt, session.lastPromptNumber, session.contentSessionId, mode, priorContext);
     activeResponseContext.current = snapshotResponseContext(session);
 
     session.conversationHistory.push({ role: 'user', content: initPrompt });
 
     session.lastPromptSentAt = Date.now();
     session.lastGeneratorSource = 'init';
+    let answeredBeforeSend = pacer.mark();
     yield {
       type: 'user',
       message: {
@@ -650,34 +931,36 @@ export class ClaudeProvider {
       parent_tool_use_id: null,
       isSynthetic: true
     };
+    if (!(await this.awaitObserverAnswer(session, pacer, answeredBeforeSend))) return;
 
     // D4 (observer batch/throttle) — buffered observation messages accumulate
     // here until shouldFlushObservationBatch() says the batch is full; a
-    // 'summarize' message always flushes any partial batch first (order
-    // preserved), then yields its own turn exactly as before. batchSize=1
-    // (the default) flushes on every single message, i.e. no change from the
-    // prior one-turn-per-tool-call behavior — buildFlush() below routes a
-    // length-1 batch through the original single-item buildObservationPrompt
-    // so the rendered prompt text is byte-identical to pre-D4 behavior.
-    let pendingObsBatch: PendingMessageWithId[] = [];
+    // 'summarize' message (and a budget recycle) flushes any partial batch
+    // first (order preserved). batchSize=1 (the default) flushes on every
+    // single message, i.e. no change from the one-turn-per-tool-call behavior;
+    // buildFlush() routes a length-1 batch through the single-item
+    // buildObservationPrompt. Fields are already compressed (compressField)
+    // when an entry is buffered, so the prompt builders only format.
+    // A flushed batch is ONE yield followed by ONE answer wait (#4066).
+    let pendingObsBatch: Array<{ message: PendingMessageWithId; toolInput: unknown; toolOutput: unknown }> = [];
 
     const buildFlush = (): SDKUserMessage => {
       const obsPrompt = pendingObsBatch.length === 1
         ? buildObservationPrompt({
             id: 0, // Not used in prompt
-            tool_name: pendingObsBatch[0].tool_name!,
-            tool_input: JSON.stringify(pendingObsBatch[0].tool_input),
-            tool_output: JSON.stringify(pendingObsBatch[0].tool_response),
+            tool_name: pendingObsBatch[0].message.tool_name!,
+            tool_input: JSON.stringify(pendingObsBatch[0].toolInput),
+            tool_output: JSON.stringify(pendingObsBatch[0].toolOutput),
             created_at_epoch: Date.now(),
-            cwd: pendingObsBatch[0].cwd
+            cwd: pendingObsBatch[0].message.cwd
           })
-        : buildBatchedObservationPrompt(pendingObsBatch.map(m => ({
+        : buildBatchedObservationPrompt(pendingObsBatch.map(e => ({
             id: 0,
-            tool_name: m.tool_name!,
-            tool_input: JSON.stringify(m.tool_input),
-            tool_output: JSON.stringify(m.tool_response),
+            tool_name: e.message.tool_name!,
+            tool_input: JSON.stringify(e.toolInput),
+            tool_output: JSON.stringify(e.toolOutput),
             created_at_epoch: Date.now(),
-            cwd: m.cwd
+            cwd: e.message.cwd
           })));
 
       session.conversationHistory.push({ role: 'user', content: obsPrompt });
@@ -696,6 +979,9 @@ export class ClaudeProvider {
       };
     };
 
+    // Each pass waits for the previous prompt's answer at the bottom of the loop,
+    // BEFORE the iterator is pulled again, so nothing is claimed while a prompt
+    // is still unanswered (#4066).
     for await (const message of this.sessionManager.getMessageIterator(session.sessionDbId)) {
       session.pendingAgentId = message.agentId ?? null;
       session.pendingAgentType = message.agentType ?? null;
@@ -709,8 +995,43 @@ export class ClaudeProvider {
           session.lastPromptNumber = message.prompt_number;
         }
 
+        // Retire a full generation BEFORE yielding. The SDK holds the real
+        // conversation server-side, but conversationHistory tracks every prompt
+        // fed into it, so its size is the proxy for how close that conversation
+        // is to the ceiling (#3800).
+        // D4 — this check sits ABOVE the observationsProcessed increment so a
+        // message re-delivered after a recycle is not counted twice.
+        if (shouldRecycleConversation(session.conversationHistory, this.conversationMaxChars())) {
+          // D4 — flush a partial batch first so buffered (already claimed)
+          // observations are answered rather than silently dropped by the return.
+          if (pendingObsBatch.length > 0) {
+            const flushed = buildFlush();
+            pendingObsBatch = [];
+            // D4 — the current message is claimed but NOT part of this flush.
+            // The flush answer confirms every id in claimedMessageIds, so unclaim
+            // it for the flush and reclaim it afterwards; recycleObserverConversation
+            // then releases it via resetProcessingToPending for re-delivery.
+            const unclaimIdx = session.claimedMessageIds.indexOf(message._persistentId);
+            const wasUnclaimed = unclaimIdx !== -1;
+            if (wasUnclaimed) session.claimedMessageIds.splice(unclaimIdx, 1);
+            answeredBeforeSend = pacer.mark();
+            yield flushed;
+            const answered = await this.awaitObserverAnswer(session, pacer, answeredBeforeSend);
+            if (wasUnclaimed) session.claimedMessageIds.push(message._persistentId); // D4 reclaim
+            if (!answered) return;
+          }
+          await recycleObserverConversation(
+            session,
+            this.sessionManager,
+            worker,
+            'budget',
+            `conversation reached ${conversationChars(session.conversationHistory)} chars`,
+          );
+          return;
+        }
+
+        // D4 — counted per SOURCE message, before any batching or dropping.
         session.observationsProcessed = (session.observationsProcessed ?? 0) + 1;
-        activeResponseContext.current = snapshotResponseContext(session);
 
         if (shouldDropForObservationCap(session.observationsProcessed, maxObservationsPerSession)) {
           if (!session.observationCapWarned) {
@@ -724,20 +1045,52 @@ export class ClaudeProvider {
           this.sessionManager.dropClaimedMessage(session.sessionDbId, message._persistentId);
           continue;
         }
+        // D4 — snapshot only for messages that will be sent (dropped messages never reach the SDK).
+        activeResponseContext.current = snapshotResponseContext(session);
 
-        pendingObsBatch.push(message);
+        // An oversized payload is condensed by a bounded model pass before the
+        // prompt is built, so the observation carries a summary of the whole
+        // field rather than a head/tail slice with the middle cut out (#3800).
+        // D4 — applied per observation as it is buffered, so batched entries
+        // get the same treatment as the single-observation path.
+        const optimized = compressField
+          ? await optimizeObservationFields(
+              { toolInput: message.tool_input, toolOutput: message.tool_response },
+              compressField,
+              { sessionDbId: session.sessionDbId, toolName: message.tool_name },
+            )
+          : { toolInput: message.tool_input, toolOutput: message.tool_response };
+
+        // D4 — a flushed batch is stored under the newest buffered message's prompt
+        // number and response-context snapshot: an accepted trade-off of batching.
+        pendingObsBatch.push({ message, toolInput: optimized.toolInput, toolOutput: optimized.toolOutput });
+        // D4 — partial batch: go straight to the next message. No yield, so no
+        // pacer.mark() and no answer wait (pacing is not advanced for a non-yield).
         if (!shouldFlushObservationBatch(pendingObsBatch.length, observationBatchSize)) {
           continue;
         }
 
         const flushed = buildFlush();
         pendingObsBatch = [];
+        answeredBeforeSend = pacer.mark();
         yield flushed;
+        if (!(await this.awaitObserverAnswer(session, pacer, answeredBeforeSend))) return;
       } else if (message.type === 'summarize') {
+        // D4 — flush a partial observation batch before the summarize turn so queued observations are never lost.
         if (pendingObsBatch.length > 0) {
           const flushed = buildFlush();
           pendingObsBatch = [];
+          // D4 — the summarize message is claimed but not yet sent. Unclaim it so
+          // the flush answer does not confirm it early (crash safety), then
+          // reclaim it once the flush has been answered.
+          const unclaimIdx = session.claimedMessageIds.indexOf(message._persistentId);
+          const wasUnclaimed = unclaimIdx !== -1;
+          if (wasUnclaimed) session.claimedMessageIds.splice(unclaimIdx, 1);
+          answeredBeforeSend = pacer.mark();
           yield flushed;
+          const answered = await this.awaitObserverAnswer(session, pacer, answeredBeforeSend);
+          if (wasUnclaimed) session.claimedMessageIds.push(message._persistentId); // D4 reclaim
+          if (!answered) return;
         }
 
         const summaryPrompt = buildSummaryPrompt({
@@ -753,6 +1106,7 @@ export class ClaudeProvider {
 
         session.lastPromptSentAt = Date.now();
         session.lastGeneratorSource = 'summarize';
+        answeredBeforeSend = pacer.mark();
         yield {
           type: 'user',
           message: {
@@ -763,8 +1117,71 @@ export class ClaudeProvider {
           parent_tool_use_id: null,
           isSynthetic: true
         };
+        if (!(await this.awaitObserverAnswer(session, pacer, answeredBeforeSend))) return;
       }
     }
+
+    // D4 — the iterator ended (idle timeout aborts the signal; a closed buffer
+    // does not). A partial batch is still claimed and was never sent.
+    if (pendingObsBatch.length > 0) {
+      if (!session.abortController.signal.aborted) {
+        // Normal flush: the SDK query loop is still iterating this generator.
+        const flushed = buildFlush();
+        pendingObsBatch = [];
+        answeredBeforeSend = pacer.mark();
+        yield flushed;
+        await this.awaitObserverAnswer(session, pacer, answeredBeforeSend);
+      } else {
+        // Aborted: nothing will consume a yield. Release the claims so the
+        // batch is re-delivered by the next generator pass.
+        logger.debug('SDK', 'Releasing unsent partial observation batch after aborted iterator end', {
+          sessionDbId: session.sessionDbId,
+          batchSize: pendingObsBatch.length,
+          abortReason: session.abortReason,
+        });
+        pendingObsBatch = [];
+        await this.sessionManager.resetProcessingToPending(session.sessionDbId);
+      }
+    }
+  }
+
+  /**
+   * Hold the feed until the prompt just yielded has been answered (#4066).
+   * Returns false when the generator should end instead of pulling more work.
+   *
+   * The wait sits outside the drain, so a slow reply never counts as drain
+   * idleness. Nothing else watches a live-but-silent SDK child, though: the
+   * drain's idle timeout used to catch it once the unpaced feed had claimed
+   * everything. The same window is applied here, but a stall preserves the
+   * claimed batch ('transport' exit) instead of finalizing the session and
+   * dropping the backlog the way an idle exit does.
+   */
+  private async awaitObserverAnswer(
+    session: ActiveSession,
+    pacer: ObserverResponsePacer,
+    answeredBeforeSend: number,
+  ): Promise<boolean> {
+    const stallMs = this.responseStallMs();
+    const outcome = await pacer.waitForAnswer(answeredBeforeSend, session.abortController.signal, stallMs);
+    if (outcome === 'answered') return !session.abortController.signal.aborted;
+    if (outcome === 'stalled') {
+      logger.warn('SDK', 'Observer prompt went unanswered; preserving the claimed batch and stopping this generation', {
+        sessionId: session.sessionDbId,
+        waitedMs: stallMs,
+        claimed: session.claimedMessageIds.length,
+      });
+      // Abort before releasing the claims: the pacer has already fenced the SDK
+      // loop, and killing the stream first means no late frame can be processed
+      // between the release and the abort.
+      session.abortReason = 'transport:response_stall';
+      try {
+        session.abortController.abort();
+      } catch {
+        // best-effort
+      }
+      await this.sessionManager.resetProcessingToPending(session.sessionDbId);
+    }
+    return false;
   }
 
   private getModelId(): string {
@@ -772,5 +1189,10 @@ export class ClaudeProvider {
     const settings = SettingsDefaultsManager.loadFromFile(settingsPath);
     // Resolve $TIER:<fast|smart|simple|summary> aliases at request time (#2289).
     return resolveTierAlias(settings.CLAUDE_MEM_MODEL, settings);
+  }
+
+  private getSummaryModelId(): string {
+    const settings = SettingsDefaultsManager.loadFromFile(paths.settings());
+    return resolveSummaryTierModel(resolveTierAlias(settings.CLAUDE_MEM_MODEL, settings), settings);
   }
 }

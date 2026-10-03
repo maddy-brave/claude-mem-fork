@@ -8,7 +8,13 @@ bring the fork forward without re-introducing already-fixed bugs.
 
 ## Branch + tag layout
 
-- `stable-v13.10.2` — **current canonical branch.** Base: upstream **v13.10.2**, merged
+- `stable-v13.28.0` — **current canonical branch** (2026-10-03). Base: upstream **v13.28.0**,
+  merged on top of the `stable-v13.17.0` line at `d894c7b7`. Released as `13.28.0-fork.1`.
+- `stable-v13.17.0` — prior canonical branch. Base: upstream **v13.17.0**, merged on
+  top of the `stable-v13.10.2` line. Head `d894c7b7` is `13.17.0-fork.2`. The 2026-10-03
+  `13.28.0-fork.1` merge of upstream `v13.28.0` is cut from this head. Rollback tag
+  `rollback/2026-10-03-pre-v13.28.0-rebase` at `d894c7b7`.
+- `stable-v13.10.2` — prior canonical branch. Base: upstream **v13.10.2**, merged
   on top of the prior `stable-v13.6.1` line (which was at `v13.6.1-fork.3` plus the D4
   observer batch/throttle commit). Merge-based history (see "Rebase procedure"). Mac- and
   Windows-compatible. Rollback tag `rollback/2026-07-11-pre-v13.10.2-rebase` (pre-merge
@@ -52,6 +58,20 @@ bring the fork forward without re-introducing already-fixed bugs.
   worker+sdk equal to the pre-refresh baseline (only the known environmental
   worker-spawn status failure; CORS one-offs characterized as port-race flakes,
   0/8 failures in isolated repeats).
+- `v13.12.4-fork.1` — fork release on the v13.12.4 line (2026-08-01). Commit `6eca8973a`.
+  Newest fork tag found in the clone before the 13.17.0 merge.
+- `v13.17.0-fork.1` — upstream **v13.17.0** merge (2026-08-29). Merge commit `fe0306b3`
+  joins `6eca8973a` with upstream base `7a767820b`; version commit `fe3859e6a`. Rollback tag
+  `rollback/2026-08-29-pre-v13.17.0-rebase`.
+- `v13.17.0-fork.2` — follow-up release on `stable-v13.17.0` (2026-08-29). Head `d894c7b7`.
+  Tag `v13.17.0-fork.1` exists on origin; fork.2 shipped by branch promotion with no tag, so
+  `d894c7b7` is identified by the rollback tag above.
+- `v13.28.0-fork.1` — upstream **v13.28.0** merge (2026-10-03). Merges tag `v13.28.0`
+  (commit `57c38303`) into `stable-v13.17.0` at `d894c7b7`; common base `7a767820b`. Rollback
+  tag `rollback/2026-10-03-pre-v13.28.0-rebase` at `d894c7b7`. Drops the `isPortInUse` bind-probe
+  signature patch, removes four rows that were already upstream, and adds the port-reclaim
+  composition (see "Patch inventory"). Merge the TAG, not `upstream/main`, which was 233
+  commits past it.
 - Older: `stable` (base v13.3.0), `mac-sh-hook-wrapper-2026-05-28` (v13.3.0 + the old
   Mac wrap), tag `v13.3.1-fork.2`, and `rollback/2026-06-11-pre-v13.5.5-rebase`
   (pre-rebase rollback point). Do not delete; they are the rollback record.
@@ -59,26 +79,57 @@ bring the fork forward without re-introducing already-fixed bugs.
 Fork version string is bumped to `<upstream>-fork.N` on every rebase so the plugin
 cache key changes and Claude Code lands fresh content in a new cache dir.
 
-## Patch inventory (status at v13.10.2)
+## Patch inventory (status at 13.28.0-fork.1, 2026-10-03)
 
-| Area | Origin | Platform | Status at v13.10.2 |
+P-numbers match the 2026-10-03 merge conflict report. Rows without a P-number are DROPPED or
+ALREADY UPSTREAM and are kept as the record of what not to reintroduce.
+
+| Area | Origin | Platform | Status at 13.28.0-fork.1 |
 |---|---|---|---|
-| Worker port-walk on EADDRINUSE + kernel bind probe + pidfile-authoritative `getWorkerPort` | `src/services/worker-service.ts`, `worker-spawner.ts`, `src/shared/worker-utils.ts`, `HealthMonitor.ts` | cross (Windows phantom-listener primary) | **KEEP, RE-DERIVED + EXTENDED at v13.10.2.** Upstream `isPortInUse` adopted the POSIX bind probe but on win32 STILL HTTP-probes (the phantom false-negative trap) — fork keeps the bind probe on all platforms, now defaulting to the configured worker host. The daemon-side walk loop in `WorkerService.start()` was silently LOST at the v13.6.1 rebase (only pidfile discovery was kept — "Option A") and is RESTORED here, walk base `getConfiguredWorkerPort()`, actual bound port written to the pidfile + `clearPortCache()`. NEW (ledger B1 fix): the `--daemon` duplicate gate health-probes (`waitForHealth`) before refusing — bound-but-unresponsive (ghost/foreign) falls through to the walk instead of `exit 0`. Fork-side `isProcessAlive` re-pointed to upstream's `supervisor/process-registry.isPidAlive`. All fork blocks tagged `// WINDOWS-FORK:`. |
+| P1 Worker port-walk on EADDRINUSE + pidfile-authoritative `getWorkerPort` | `src/services/worker-service.ts`, `worker-spawner.ts`, `src/shared/worker-utils.ts` | cross (Windows phantom-listener primary) | **KEEP, carried forward at 13.28.0-fork.1.** The `HealthMonitor.isPortInUse(port, host)` bind-probe signature is DROPPED, see the next row. Re-derived at v13.10.2 as follows. The daemon-side walk loop in `WorkerService.start()` was silently LOST at the v13.6.1 rebase (only pidfile discovery was kept — "Option A") and is RESTORED here, walk base `getConfiguredWorkerPort()`, actual bound port written to the pidfile + `clearPortCache()`. NEW (ledger B1 fix): the `--daemon` duplicate gate health-probes (`waitForHealth`) before refusing — bound-but-unresponsive (ghost/foreign) falls through to the walk instead of `exit 0`. Fork-side `isProcessAlive` re-pointed to upstream's `supervisor/process-registry.isPidAlive`. All fork blocks tagged `// WINDOWS-FORK:`. |
+| `HealthMonitor.isPortInUse(port, host)` kernel bind-probe signature | `src/services/infrastructure/HealthMonitor.ts` | cross | **DROPPED at 13.28.0-fork.1 → upstreamed.** Upstream `isPortInUse(port, timeoutMs?)` is bounded (`155fefce7`) and already falls through to a bind probe (`11518bc09`). Take upstream's function whole. Fork call sites in `worker-utils.ts` and `worker-spawner.ts` now pass `(port)` only. If the old `(port, host)` signature survives, upstream's `waitForPortFree` passes a number as `host`. |
 | Observer poison-loop Fix A: respawn only on `poisoned` output class | was `src/services/worker/agents/ResponseProcessor.ts` (fork.3) | cross | **DROPPED → upstreamed (v13.9.0, `ad4bd6f7`).** Upstream went further than Fix A: the `poisoned` class, `respawnPoisonedSession`, and invalid-output respawn are REMOVED entirely; quota-limit prose now pauses the generator and preserves the queued batch (`isQuotaLimitedObserverOutput`), other non-XML output drops-and-confirms. Do NOT reintroduce the fork block — its symbols no longer exist. |
-| Observer poison-loop Fix B: in-band rate-limit → `classifyClaudeError` `rate_limit` → OAuth pool rotation + keychain cooldown | `src/services/worker/ClaudeProvider.ts`, `src/shared/oauth-token.ts`, `oauth-token-pool.ts` (fork.3) | cross (Claude-Code-only machines primary) | **KEEP** — fork-only (the token pool does not exist upstream). Coexists with upstream's quota-pause: the provider throw fires first during streaming; upstream's `ResponseProcessor` quota branch is defense-in-depth behind it. |
-| D4 observer batch/throttle: `CLAUDE_MEM_OBSERVATION_BATCH_SIZE` + `CLAUDE_MEM_MAX_OBSERVATIONS_PER_SESSION` | `src/sdk/prompts.ts`, `src/services/worker/ClaudeProvider.ts`, `SessionManager.ts`, `worker-types.ts`, `SettingsDefaultsManager.ts` | cross | **KEEP (fork-only, default-off).** Coalesces N buffered observation events into one observer SDK turn; per-session observation cap with drop-and-confirm. Defaults (1 / 0) preserve upstream behavior byte-identically. |
+| P4 OAuth token pool + Fix B: `classifyClaudeError` `rate_limit` → pool rotation + keychain cooldown, Option A fall-through | `src/shared/oauth-token-pool.ts`, `src/shared/oauth-token.ts`, `src/services/worker/ClaudeProvider.ts`, `src/cli/handlers/context.ts` (hint text) | cross (Claude-Code-only machines primary) | **KEEP** — fork-only (the token pool does not exist upstream). After upstream `aa8ac2e79` and `fb755ce3c`, check that the pool still slots after env-fallback. Coexists with upstream's quota-pause: the provider throw fires first during streaming; upstream's `ResponseProcessor` quota branch is defense-in-depth behind it. |
+| P5 In-band rate-limit throw: usage-limit assistant text → classified `rate_limit` throw | `src/services/worker/ClaudeProvider.ts` | cross | **KEEP.** Upstream `40bb3a663` moved the SDK quota signal to `rate_limit_event`. After each merge confirm the throw still reaches the `classifyClaudeError` catch before upstream's `isQuotaLimitedObserverOutput` pause can swallow it. |
+| P6 D4 observer batch/throttle: `CLAUDE_MEM_OBSERVATION_BATCH_SIZE` + `CLAUDE_MEM_MAX_OBSERVATIONS_PER_SESSION` | `src/sdk/prompts.ts`, `src/services/worker/ClaudeProvider.ts`, `SessionManager.ts`, `worker-types.ts`, `SettingsDefaultsManager.ts`, `tests/worker/observation-batch-throttle.test.ts` | cross | **KEEP (fork-only, default-off), re-implemented at 13.28.0-fork.1 onto upstream's paced `createMessageGenerator(session, cwdTracker, activeResponseContext, worker, compressField, pacer, observationBatchSize, maxObservationsPerSession)`.** Coalesces N buffered observation events into one observer SDK turn; per-session observation cap with drop-and-confirm. Defaults (1 / 0) preserve upstream behavior byte-identically. A flushed batch is one yield plus one answer wait, and the batched prompt builder must apply `compressField` and `stripImagePayloads`. |
 | Spawn-lock around lazy-spawn | was `src/shared/spawn-lock.ts` (fork-only) | cross | **DROPPED → upstreamed (v13.6.1).** Upstream v13.5.6 ships `src/shared/worker-spawn-gate.ts` (`acquireSpawnLock(): boolean` + `releaseSpawnLock()`, `wx`-flag `<DATA_DIR>/spawn.lock`, 60s staleness, owner-checked release) — a strict superset. `spawn-lock.ts` deleted; `worker-utils.ts`/`worker-spawner.ts` switched to the gate API (boolean + try/finally `releaseSpawnLock`). No stale build-verify guard referenced it (Gotcha 8 clear). |
-| HKCU env bootstrap when the launcher env block is empty | `src/shared/env-bootstrap.ts` (fork-only file), `SettingsDefaultsManager.ts`, `ProcessManager.ts` | Windows | **KEEP** — no upstream equivalent. |
-| `sync-marketplace` uses `fs.cpSync` instead of `rsync` | `scripts/sync-marketplace.cjs` | Windows | **KEEP** — upstream still uses rsync. Subsumes the old bun-install-cwd fix. |
-| `tree-sitter.exe` resolution | `src/services/smart-file-read/parser.ts` | Windows | **KEEP** — upstream `getTreeSitterBin()` falls back to bare `tree-sitter` with no `.exe`. Re-apply onto the rewritten parser after each rebase. |
-| `CLAUDE_CONFIG_DIR`-aware `build-and-sync` worker:restart | `package.json` scripts | cross (multi-profile) | **KEEP** — upstream hardcodes `~/.claude`. Re-derived onto upstream's new worker:restart clause as `${CLAUDE_CONFIG_DIR:-$HOME/.claude}`. |
+| P2 HKCU env bootstrap when the launcher env block is empty | `src/shared/env-bootstrap.ts` (fork-only file), `SettingsDefaultsManager.ts`, `ProcessManager.ts` | Windows | **KEEP** — no upstream equivalent. |
+| `sync-marketplace` uses `fs.cpSync` instead of `rsync` | `scripts/sync-marketplace.cjs` | Windows | **DROPPED, ALREADY UPSTREAM before the 13.17.0 base (`bb1db97dd`, build-and-sync without rsync or a POSIX shell).** No fork delta remains. |
+| `tree-sitter.exe` resolution | `src/services/smart-file-read/parser.ts` | Windows | **DROPPED, ALREADY UPSTREAM before the 13.17.0 base (`efef7e9e0`, resolve tree-sitter.exe on Windows).** No fork delta remains. Do not re-apply. |
+| `CLAUDE_CONFIG_DIR`-aware `build-and-sync` worker:restart | `package.json` scripts | cross (multi-profile) | **DROPPED, no fork delta exists at 13.28.0-fork.1.** The `package.json` fork diff against the 13.17.0 base is the version line only, and no `CLAUDE_CONFIG_DIR` text is present in the sync scripts. Do not re-derive. |
 | Mac `bash -c` hook wrap | `plugin/hooks/hooks.json` (was a separate Mac branch) | Mac | **DROPPED** — upstream refactored hook commands to be POSIX `sh`-clean (replaced bash process substitution `< <(...)` with a portable `... \| while read` loop). Each command now parses and runs under `/bin/sh`. Verify after each rebase (see below) before assuming it stays unnecessary. |
 | PreToolUse:Read timeout (was 10s) | `plugin/hooks/hooks.json` | cross | **DROPPED** — accept upstream's 60s. The 2000s runaway the 10s addressed no longer exists upstream. |
 | chroma: skip `cmd.exe` wrapper for uvx spawn | `src/services/sync/ChromaMcpManager.ts` | Windows | **DROPPED → upstreamed.** Upstream spawns uvx directly on all platforms and adds `resolveUvxCommand()` (absolute uvx path on Windows). Strict superset of the fork fix. |
 | mcp-search node launcher (`mcp-launcher.cjs`) + root `.mcp.json` restore | `plugin/.mcp.json`, `plugin/scripts/mcp-launcher.cjs`, `scripts/build-hooks.js` | cross | **DROPPED → upstreamed.** Upstream ships an inline `node -e` launcher in `plugin/.mcp.json`. `mcp-launcher.cjs` deleted; the fork build verification was aligned to upstream's inline launcher. |
 | EACCES/EPIPE drain-all hook guard | `plugin/hooks/hooks.json` | cross | **DROPPED → upstreamed** verbatim. |
-| Windows `bun.exe` direct-spawn (no `cmd.exe` shell) | `plugin/scripts/bun-runner.js` | Windows | **KEEP** — no upstream equivalent. Upstream resolves `bun.cmd` and spawns it with `shell:true`, so the chain is `node -> cmd.exe -> bun.exe`; with `windowsHide:true` the `cmd.exe` is hidden but it launches `bun.exe` WITHOUT propagating `CREATE_NO_WINDOW`, so the `bun.exe` grandchild gets a fresh **visible** console — one flash per capture-hook firing (`observation`/`file-context`/`summarize`) on Windows, i.e. effectively per tool use. The patch makes `findBun()` prefer `~/.bun/bin/bun.exe` and spawns it DIRECTLY (no shell) so `windowsHide:true` (`CREATE_NO_WINDOW`) actually suppresses the window; the `shell:true` path is retained only as a fallback for when no real `bun.exe` is resolvable (a `bun.cmd` shim cannot be spawned without a shell). bun-runner.js is copied verbatim (not bundled), so this takes effect on a plain marketplace sync with no rebuild. Re-apply onto any rewritten bun-runner after a rebase. Origin: 2026-06-16 spawn-flash durable fix, complements the external pyw windowless shim (`claude-mem-hook-windowless.py`) that handles the node-level console. At v13.10.2 upstream's spawn-shim centralization (`83dd5925`) only fixed the `where bun` lookup (direct `where` spawn, `windowsHide:true`) — merged cleanly alongside the fork patch. |
+| Windows `bun.exe` direct-spawn (no `cmd.exe` shell) | `plugin/scripts/bun-runner.js` | Windows | **DROPPED, ALREADY UPSTREAM before the 13.17.0 base (`cb4675a8e`, `91736b492`).** Upstream spawns a resolved `bun.exe` directly and uses `cmd.exe` only for `.cmd` and `.bat` shims. The text below is the historical rationale. Formerly upstream resolved `bun.cmd` and spawns it with `shell:true`, so the chain is `node -> cmd.exe -> bun.exe`; with `windowsHide:true` the `cmd.exe` is hidden but it launches `bun.exe` WITHOUT propagating `CREATE_NO_WINDOW`, so the `bun.exe` grandchild gets a fresh **visible** console — one flash per capture-hook firing (`observation`/`file-context`/`summarize`) on Windows, i.e. effectively per tool use. The patch makes `findBun()` prefer `~/.bun/bin/bun.exe` and spawns it DIRECTLY (no shell) so `windowsHide:true` (`CREATE_NO_WINDOW`) actually suppresses the window; the `shell:true` path is retained only as a fallback for when no real `bun.exe` is resolvable (a `bun.cmd` shim cannot be spawned without a shell). bun-runner.js is copied verbatim (not bundled), so this takes effect on a plain marketplace sync with no rebuild. Do not re-apply after a rebase; upstream carries the equivalent. Origin: 2026-06-16 spawn-flash durable fix, complements the external pyw windowless shim (`claude-mem-hook-windowless.py`) that handles the node-level console. At v13.10.2 upstream's spawn-shim centralization (`83dd5925`) only fixed the `where bun` lookup (direct `where` spawn, `windowsHide:true`) — merged cleanly alongside the fork patch. |
 | Marketplace-path lazy-spawn (ledger bug B3) | was fork-open | cross | **CLOSED → upstreamed (v13.10.1/.2, `eeaadb4a` + `c275b340`).** `resolveWorkerScriptPath` is now cache-FIRST (versioned cache dirs, then marketplace, then cwd) with a `CLAUDE_MEM_WORKER_SCRIPT_PATH` override, so hook/MCP/CLI/restart launches converge on one worker bundle and the `node_modules`-less marketplace clone is no longer the lazy-spawn target. |
+| P3 Lazy-spawn env through `sanitizeEnv` plus DATA_DIR and PORT injection | `src/shared/worker-utils.ts` | cross | **KEEP.** Strips `CLAUDE_CODE_*` from the detached worker env. Now sits alongside upstream's `cwd: DATA_DIR` in the same `spawnHidden` options object; keep both. |
+| P7 Cross-profile worker identity mismatch warning | `src/shared/worker-utils.ts` (`fetchWorkerHealthWorkerPath`, `deriveConfigDirFromWorkerPath`, `warnIfWorkerIdentityMismatched`) | cross (multi-profile) | **KEEP.** Detects and surfaces only. Warns when `/api/health.workerPath` differs from this profile's resolved script. Re-inserted at 13.28.0-fork.1 inside upstream's `if (ready)` branch. Upstream has no `workerPath` consumer. |
+| P8 bun 1.3.13 Windows `unref` and AbortSignal workarounds | `src/services/worker-shutdown.ts`, `tests/services/stale-abort-controller-guard.test.ts` | Windows | **KEEP.** Drops `deadlineTimer.unref?.()` so the hard deadline fires, and polls `.aborted` in the test. Upstream still has the `unref` call at v13.28.0. |
+| P9 sync-matrix E2E safety test restore | `tests/infrastructure/sync-matrix-e2e-safety.test.ts` | cross | **KEEP.** Puts upstream's test back after the sync-hub exclusion. Net delta against the upstream base is zero. |
+| P10 Exclude the `workers/sync-hub` tree | `workers/sync-hub/**` | cross | **KEEP.** The fork does not ship the Cloudflare sync hub. Fork deletion wins every merge, resolved with `git rm -r workers/sync-hub`. Upstream keeps modifying it, so expect modify/delete conflicts. |
+| P11 DB management scripts | `scripts/batch-import-from-db.ts`, `scripts/dump-backup-to-import-json.ts` | cross | **KEEP.** Operator import and backup tools. No upstream collision. |
+| P12 Version-check test hardening | `tests/plugin-version-check.test.ts` | cross | **KEEP.** Adds `CLAUDE_MEM_DISABLE_SELFHEAL` and missing-modules tests. |
+| P13 Fork tooling and docs | `.claude/settings.json`, `.gitignore`, `CHANGELOG.md`, `MAINTAINING_THIS_FORK.md`, `src/sdk/hardened-options.ts` | cross | **KEEP.** The `hardened-options.ts` delta is an SDK-version comment only; on conflict take upstream. |
+| P14 Fork version strings and rebuilt bundles | 8 manifests, 4 `.cjs` bundles, `plugin/scripts/context-generator.cjs`, `plugin/ui/viewer-bundle.js` | cross | **KEEP.** Version is `13.28.0-fork.1` in the 8 manifests. See "Release-file checklist". Bundles are taken from upstream on conflict and rebuilt. |
+
+### Port-reclaim composition (13.28.0-fork.1)
+
+Upstream `cd5108c1d` added `src/shared/port-reclaim.ts` with `reclaimGhostListeningPort`. It
+clears a ghost LISTEN socket only when every owner PID is dead and a chroma sidecar tree
+(`uv`, `uvx`, `python`, `chroma-mcp`) is pinning the port. A live owner is never touched.
+Upstream calls it in the daemon gate of `worker-service.ts` and in `worker-spawner.ts`, and
+refuses to start when it declines (`process.exit(0)` and `return 'dead'` respectively).
+
+This does not obsolete the port walk. Ghosts from `Stop-Process -Force` or from cache dirs
+deleted under a running worker have no sidecar, and only a reboot clears them. A refusal when
+reclaim declines is the B1 "no worker at all" failure.
+
+KEEP composition: health wait, then upstream reclaim, then fall through to the fork's
+EADDRINUSE port walk. Replace upstream's `process.exit(0)` and `return 'dead'` with the
+fork's warn-and-continue. Rule: never refuse to start on a ghost listener. Both `readPidFile`
+and `probeWorkerBootFailure` must be imported in `worker-spawner.ts`.
 
 Fork-only files that must survive every rebase: `src/shared/env-bootstrap.ts`,
 `src/shared/oauth-token-pool.ts` (fork.3 OAuth pool). NOTE: `src/shared/spawn-lock.ts`
@@ -194,6 +245,46 @@ replay commits upstream already contains and explode the conflict surface. Alway
    and runs a generator-canonical verify on the hook command strings). Bump the fork
    version in `package.json` and `.claude-plugin/marketplace.json` first.
 8. Commit the merge, tag `v<upstream>-fork.N`, push branches + tag.
+
+## Rebase gotchas
+
+1. NEVER let a shell's working directory sit inside any claude-mem checkout while Claude Code
+   hooks can fire. `src/shared/worker-utils.ts` resolves the worker script and plugin version
+   from `process.cwd()` plus `plugin/scripts/worker-service.cjs` when the cwd is a claude-mem
+   repo. A hook firing from inside a checkout treats that checkout as the installed plugin,
+   detects a version mismatch, kills the live worker and spawns the checkout's worker. On
+   2026-10-03 this swapped the live worker for pristine upstream v13.28.0 out of a test
+   worktree and applied schema migrations 50 to 52 to the live database before anyone noticed.
+   Use `git -C <path>` and subshells such as `( cd <path> && bun install )` so the outer cwd
+   never moves.
+2. Back up `<CLAUDE_MEM_DATA_DIR>/claude-mem.db` BEFORE any new-version worker can start, not
+   merely before deploy. Use the SQLite backup API copy.
+
+## Release-file checklist
+
+All eight files carry the fork version literal and must read `<upstream>-fork.N`, here
+`13.28.0-fork.1`. A raw merge with `--theirs` leaves the bare upstream version, so set it by hand:
+
+| # | File |
+|---|---|
+| 1 | `package.json` |
+| 2 | `plugin/package.json` |
+| 3 | `.claude-plugin/plugin.json` |
+| 4 | `plugin/.claude-plugin/plugin.json` |
+| 5 | `.codex-plugin/plugin.json` |
+| 6 | `plugin/.codex-plugin/plugin.json` |
+| 7 | `.claude-plugin/marketplace.json` |
+| 8 | `openclaw/openclaw.plugin.json` |
+
+- In `.claude-plugin/marketplace.json` a separate `0.1.3` on a later line is another entry. Leave it.
+- Excluded: `openclaw/package.json` and `.agents/plugins/marketplace.json`.
+- Regenerated by `npm run build` and committed: `plugin/scripts/worker-service.cjs`,
+  `mcp-server.cjs`, `server-service.cjs`, `transcript-watcher.cjs`, plus the tracked
+  `plugin/scripts/context-generator.cjs` and `plugin/ui/viewer-bundle.js`.
+- Tag annotated `v<upstream>-fork.N` at the merge commit. Create the rollback tag BEFORE merging.
+- After the bump, grep the whole repo for the previous version to catch stragglers. The
+  `tests/infrastructure/version-consistency.test.ts` bare-semver failure is an accepted
+  fork-expected failure.
 
 ## Post-rebase verification (do not skip)
 

@@ -72,6 +72,10 @@ bring the fork forward without re-introducing already-fixed bugs.
   signature patch, removes four rows that were already upstream, and adds the port-reclaim
   composition (see "Patch inventory"). Merge the TAG, not `upstream/main`, which was 233
   commits past it.
+- `v13.28.0-fork.2` — patch release on `stable-v13.28.0` (2026-10-10). Adds the `pydantic<2.12`
+  runtime pin to `CHROMA_MCP_DEP_OVERRIDES` in `src/services/sync/ChromaMcpManager.ts`, so the
+  chroma-mcp 0.2.6 prewarm no longer dies with an ImportError on pydantic 2.14. Verified with
+  uvx 0.11.16 on macOS. Version bumped in the 8 release-file manifests and the bundles rebuilt.
 - Older: `stable` (base v13.3.0), `mac-sh-hook-wrapper-2026-05-28` (v13.3.0 + the old
   Mac wrap), tag `v13.3.1-fork.2`, and `rollback/2026-06-11-pre-v13.5.5-rebase`
   (pre-rebase rollback point). Do not delete; they are the rollback record.
@@ -109,10 +113,11 @@ ALREADY UPSTREAM and are kept as the record of what not to reintroduce.
 | P8 bun 1.3.13 Windows `unref` and AbortSignal workarounds | `src/services/worker-shutdown.ts`, `tests/services/stale-abort-controller-guard.test.ts` | Windows | **KEEP.** Drops `deadlineTimer.unref?.()` so the hard deadline fires, and polls `.aborted` in the test. Upstream still has the `unref` call at v13.28.0. |
 | P9 sync-matrix E2E safety test restore | `tests/infrastructure/sync-matrix-e2e-safety.test.ts` | cross | **KEEP.** Puts upstream's test back after the sync-hub exclusion. Net delta against the upstream base is zero. |
 | P10 Exclude the `workers/sync-hub` tree | `workers/sync-hub/**` | cross | **KEEP.** The fork does not ship the Cloudflare sync hub. Fork deletion wins every merge, resolved with `git rm -r workers/sync-hub`. Upstream keeps modifying it, so expect modify/delete conflicts. |
+| P15 Chroma-mcp prewarm pydantic pin | `src/services/sync/ChromaMcpManager.ts` | cross | **KEEP.** `pydantic<2.12` runtime pin for chroma-mcp 0.2.6 / mcp 1.6.0 on pydantic 2.14, added at 13.28.0-fork.2. Revisit when chroma-mcp releases a version on mcp >= 1.10. |
 | P11 DB management scripts | `scripts/batch-import-from-db.ts`, `scripts/dump-backup-to-import-json.ts` | cross | **KEEP.** Operator import and backup tools. No upstream collision. |
 | P12 Version-check test hardening | `tests/plugin-version-check.test.ts` | cross | **KEEP.** Adds `CLAUDE_MEM_DISABLE_SELFHEAL` and missing-modules tests. |
 | P13 Fork tooling and docs | `.claude/settings.json`, `.gitignore`, `CHANGELOG.md`, `MAINTAINING_THIS_FORK.md`, `src/sdk/hardened-options.ts` | cross | **KEEP.** The `hardened-options.ts` delta is an SDK-version comment only; on conflict take upstream. |
-| P14 Fork version strings and rebuilt bundles | 8 manifests, 4 `.cjs` bundles, `plugin/scripts/context-generator.cjs`, `plugin/ui/viewer-bundle.js` | cross | **KEEP.** Version is `13.28.0-fork.1` in the 8 manifests. See "Release-file checklist". Bundles are taken from upstream on conflict and rebuilt. |
+| P14 Fork version strings and rebuilt bundles | 8 manifests, 4 `.cjs` bundles, `plugin/scripts/context-generator.cjs`, `plugin/ui/viewer-bundle.js` | cross | **KEEP.** Version is `13.28.0-fork.2` in the 8 manifests. See "Release-file checklist". Bundles are taken from upstream on conflict and rebuilt. |
 
 ### Port-reclaim composition (13.28.0-fork.1)
 
@@ -263,7 +268,7 @@ replay commits upstream already contains and explode the conflict surface. Alway
 ## Release-file checklist
 
 All eight files carry the fork version literal and must read `<upstream>-fork.N`, here
-`13.28.0-fork.1`. A raw merge with `--theirs` leaves the bare upstream version, so set it by hand:
+`13.28.0-fork.2`. A raw merge with `--theirs` leaves the bare upstream version, so set it by hand:
 
 | # | File |
 |---|---|

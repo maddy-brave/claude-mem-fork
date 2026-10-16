@@ -95,6 +95,16 @@ export class RateLimitStore {
   get size(): number {
     return this.entries.size;
   }
+
+  /**
+   * Drop every snapshot. The store is not keyed by pool token, so after the
+   * active token is cooled and the session rotates, the old token's rejected
+   * snapshots would re-abort the new token's first request. The new token's
+   * own events repopulate the store.
+   */
+  clear(): void {
+    this.entries.clear();
+  }
 }
 
 /** Process-wide singleton. */

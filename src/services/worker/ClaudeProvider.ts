@@ -8,6 +8,7 @@ import { USER_SETTINGS_PATH, OBSERVER_SESSIONS_DIR, ensureDir, paths } from '../
 import { buildIsolatedEnvWithFreshOAuth, getAuthMethodDescription } from '../../shared/EnvManager.js';
 import { writeStaleMarker, markKeychainCooldown, getLastTokenSelection } from '../../shared/oauth-token.js';
 import { oauthTokenPool, type CooldownKind } from '../../shared/oauth-token-pool.js';
+import { coolActiveToken } from '../../shared/quota-pool-rotation.js';
 import { findClaudeExecutable } from '../../shared/find-claude-executable.js';
 import type { ActiveSession, SDKUserMessage, PendingMessageWithId } from '../worker-types.js';
 import { ModeManager } from '../domain/ModeManager.js';
@@ -411,6 +412,15 @@ export class ClaudeProvider {
               authMethod,
             });
             session.abortReason = `quota:${decision.window ?? 'unknown'}`;
+            // Cool only the token that hit the wall. When a healthy pool token
+            // remains, drop the old token's snapshots so the rotated session
+            // is not re-aborted by them; SessionRoutes restarts the generator.
+            const cooled = coolActiveToken('quota_exhausted');
+            logger.info('OAUTH', `Quota guard cooled active token: id=${cooled.cooledId ?? 'none'} rotatedTo=${cooled.rotatedToId ?? 'none'}`, {
+              sessionDbId: session.sessionDbId,
+              window: decision.window,
+            });
+            if (cooled.rotatedToId) globalRateLimitStore.clear();
             try {
               session.abortController.abort();
             } catch {
@@ -713,11 +723,15 @@ export class ClaudeProvider {
           kind as CooldownKind,
           retryAfterMs,
         );
-        logger.info('OAUTH', `Pool token marked cooling; pool exhausted=${oauthTokenPool.allExhausted()}`, {
+        const rotatedToId = oauthTokenPool.firstHealthyId();
+        logger.info('OAUTH', `Pool token marked cooling; pool exhausted=${oauthTokenPool.allExhausted()} cooledId=${oauthTokenPool.lastSelectedId} rotatedTo=${rotatedToId ?? 'none'}`, {
           failedId: oauthTokenPool.lastSelectedId,
           kind,
           sessionDbId: session.sessionDbId,
         });
+        // The rate-limit store is global, not per token: drop the cooled
+        // token's snapshots so the next token is not aborted by them.
+        if (rotatedToId) globalRateLimitStore.clear();
 
         if (oauthTokenPool.allExhausted()) {
           // Whole pool is capped/exhausted — surface loud marker.
@@ -739,11 +753,13 @@ export class ClaudeProvider {
         // returning the rate-limited token. If the pool is empty, the keychain
         // token is still used (last-resort in readClaudeOAuthToken).
         markKeychainCooldown(kind as CooldownKind, retryAfterMs);
-        logger.info('OAUTH', `Keychain/env token cooled after ${kind}; next call will try pool`, {
+        const rotatedToId = oauthTokenPool.firstHealthyId();
+        logger.info('OAUTH', `Keychain/env token cooled after ${kind}; next call will try pool rotatedTo=${rotatedToId ?? 'none'}`, {
           source: tokenSelection.source,
           kind,
           sessionDbId: session.sessionDbId,
         });
+        if (rotatedToId) globalRateLimitStore.clear();
       } else if (kind === 'auth_invalid') {
         // Keychain / env single-token path: immediate stale marker.
         writeStaleMarker(

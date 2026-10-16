@@ -72,15 +72,15 @@ describe('classifySkillId', () => {
   });
 
   it('strips a claude-mem: prefix', () => {
-    expect(classifySkillId('claude-mem:make-plan')).toEqual({
-      skill_id: 'make-plan',
+    expect(classifySkillId('claude-mem:smart-explore')).toEqual({
+      skill_id: 'smart-explore',
       skill_source: 'first_party',
     });
   });
 
-  it('lowercases and accepts CLAUDE-MEM:DO', () => {
-    expect(classifySkillId('CLAUDE-MEM:DO')).toEqual({
-      skill_id: 'do',
+  it('lowercases and accepts CLAUDE-MEM:KNOWLEDGE-AGENT', () => {
+    expect(classifySkillId('CLAUDE-MEM:KNOWLEDGE-AGENT')).toEqual({
+      skill_id: 'knowledge-agent',
       skill_source: 'first_party',
     });
   });
@@ -127,8 +127,8 @@ describe('skillNameFromToolInput', () => {
 describe('firstPartySkillFromSlashPrompt', () => {
   it('returns the first-party id for a leading /skill token', () => {
     expect(firstPartySkillFromSlashPrompt('/mem-search how did we do auth?')).toBe('mem-search');
-    expect(firstPartySkillFromSlashPrompt('/make-plan')).toBe('make-plan');
-    expect(firstPartySkillFromSlashPrompt('  /claude-mem:do\nnext line')).toBe('do');
+    expect(firstPartySkillFromSlashPrompt('/smart-explore')).toBe('smart-explore');
+    expect(firstPartySkillFromSlashPrompt('  /claude-mem:knowledge-agent\nnext line')).toBe('knowledge-agent');
   });
 
   it('emits nothing (null) for unknown /foo and non-slash prompts', () => {
@@ -141,7 +141,7 @@ describe('firstPartySkillFromSlashPrompt', () => {
   });
 
   it('does not treat the rest of the prompt as an id', () => {
-    const id = firstPartySkillFromSlashPrompt('/standup secret project /Users/alice/repo');
-    expect(id).toBe('standup');
+    const id = firstPartySkillFromSlashPrompt('/babysit secret project /Users/alice/repo');
+    expect(id).toBe('babysit');
   });
 });

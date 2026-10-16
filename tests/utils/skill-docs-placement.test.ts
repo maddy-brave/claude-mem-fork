@@ -46,19 +46,6 @@ describe('skill docs placement (#1651)', () => {
     expect(content).not.toContain('Bundled Languages');
   });
 
-  it('cloud-sync/SKILL.md requires the authenticated Hub probe for success', () => {
-    const path = join(SKILLS_DIR, 'cloud-sync/SKILL.md');
-    expect(existsSync(path)).toBe(true);
-    const content = readFileSync(path, 'utf-8');
-
-    expect(content).toContain('hub.reachable: true');
-    expect(content).toContain('hub.reachable: false');
-    expect(content).toContain('authenticated, read-only');
-    expect(content).toContain('GET /v1/sync/status');
-    expect(content).toContain('never appends or advances');
-    expect(content).not.toContain('/api/pro/sync/status');
-  });
-
   it('cloud sync copy keeps the launch boundary and 4,000,000-byte request contract accurate', () => {
     const docs = readFileSync(join(import.meta.dir, '../../docs/public/cloud-sync.mdx'), 'utf-8');
     const source = readFileSync(join(import.meta.dir, '../../src/services/sync/CloudSync.ts'), 'utf-8');

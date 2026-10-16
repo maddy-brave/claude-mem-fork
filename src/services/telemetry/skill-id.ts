@@ -10,27 +10,10 @@
  */
 
 export const FIRST_PARTY_SKILL_IDS = [
-  'agent-cost-report',
   'babysit',
-  'ccs-align',
-  'cloud-sync',
-  'design-is',
-  'do',
-  'how-it-works',
   'knowledge-agent',
-  'learn-codebase',
-  'make-plan',
   'mem-search',
-  'mode-creator',
-  'oh-my-issues',
-  'pathfinder',
   'smart-explore',
-  'standup',
-  'timeline-report',
-  'version-bump',
-  'weekly-digests',
-  'what-the',
-  'wowerpoint',
 ] as const;
 
 export type FirstPartySkillId = (typeof FIRST_PARTY_SKILL_IDS)[number];

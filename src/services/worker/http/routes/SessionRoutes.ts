@@ -42,9 +42,12 @@ import {
   tryAdmitQuotaProbe,
   releaseQuotaProbe,
   recordQuotaExhausted,
+  clearQuotaCooldown,
   getQuotaCooldown,
   QUOTA_EXHAUSTED_RECHECK_COOLDOWN_MS,
 } from '../../../../shared/quota-cooldown.js';
+import { planPoolRotation } from '../../../../shared/quota-pool-rotation.js';
+import { oauthTokenPool } from '../../../../shared/oauth-token-pool.js';
 import { isClassified, describeProviderError } from '../../provider-errors.js';
 import { classifyClaudeError } from '../../ClaudeProvider.js';
 import { isSessionParkedForSlot } from '../../../../supervisor/process-registry.js';
@@ -299,6 +302,21 @@ export class SessionRoutes extends BaseRouteHandler {
     // Claim the probe rather than merely reading the clock: every live session
     // sees the window elapse at the same instant, so a bare check would let
     // them all through together.
+    // A breaker left over from a single token's refusal must not hold the
+    // provider shut while another pool token is healthy.
+    if (
+      selectedProvider === 'claude' &&
+      getQuotaCooldown(selectedProvider) &&
+      oauthTokenPool.hasHealthyToken()
+    ) {
+      clearQuotaCooldown(selectedProvider);
+      logger.warn('SESSION', 'Cleared the provider quota breaker because a healthy pool token exists', {
+        sessionId: sessionDbId,
+        source,
+        provider: selectedProvider,
+        healthyTokenId: oauthTokenPool.firstHealthyId(),
+      });
+    }
     const admission = tryAdmitQuotaProbe(selectedProvider);
     if (!admission.admitted) {
       // This run is not starting, so it must not hold the gateway re-probe.
@@ -323,6 +341,40 @@ export class SessionRoutes extends BaseRouteHandler {
     await this.startGeneratorWithProvider(
       session, selectedProvider, source, admission.claimId, gatewayProbeClaimId,
     );
+  }
+
+  /**
+   * After a quota refusal cooled the active token: true when a healthy pool
+   * token exists and the caller must restart on it instead of arming the
+   * provider-wide breaker. Clears any stale breaker in that case. False means
+   * arm the breaker (pool exhausted, no pool, or the restart guard tripped).
+   */
+  private tryQuotaRotation(
+    provider: 'claude' | 'gemini' | 'openrouter',
+    sessionDbId: number,
+    window?: string,
+  ): boolean {
+    if (provider !== 'claude') return false;
+    const plan = planPoolRotation();
+    if (!plan.rotate) {
+      if (plan.reason !== 'no_pool') {
+        logger.warn('SESSION', `Arming the provider quota breaker: ${plan.reason}`, {
+          sessionId: sessionDbId,
+          provider,
+          ...(window ? { window } : {}),
+          ...(plan.recentRestarts !== undefined ? { recentRestarts: plan.recentRestarts, restartLimit: plan.restartLimit } : {}),
+        });
+      }
+      return false;
+    }
+    clearQuotaCooldown(provider);
+    logger.warn('SESSION', `Quota hit on one pool token; rotating to token ${plan.rotatedToId} without arming the provider breaker`, {
+      sessionId: sessionDbId,
+      provider,
+      ...(window ? { window } : {}),
+      rotatedToId: plan.rotatedToId,
+    });
+    return true;
   }
 
   private async startGeneratorWithProvider(
@@ -369,6 +421,9 @@ export class SessionRoutes extends BaseRouteHandler {
     const myController = session.abortController;
 
     let skipGeneratorExitFinalization = false;
+    // Set when a quota refusal rotated to a healthy pool token: no breaker is
+    // armed and the generator restarts once it has exited.
+    let rotatedForQuota = false;
     let generatorPromise: Promise<void>;
 
     generatorPromise = agent.startSession(session, this.workerService)
@@ -455,11 +510,17 @@ export class SessionRoutes extends BaseRouteHandler {
           // A structured quota refusal arms the breaker, so the next observation
           // does not immediately buy the same refusal again (#3634).
           if (isClassified(error) && error.kind === 'quota_exhausted') {
-            recordQuotaExhausted(provider, error.message);
+            if (this.tryQuotaRotation(provider, session.sessionDbId)) {
+              rotatedForQuota = true;
+            } else {
+              recordQuotaExhausted(provider, error.message);
+            }
           }
-          recordObserverFailure(provider, isClassified(error)
-            ? { message: error.message, kind: error.kind, code: error.code, action: error.action, url: error.url, requestId: error.requestId }
-            : errorMsg);
+          if (!rotatedForQuota) {
+            recordObserverFailure(provider, isClassified(error)
+              ? { message: error.message, kind: error.kind, code: error.code, action: error.action, url: error.url, requestId: error.requestId }
+              : errorMsg);
+          }
         }
         telemetryBuffer.record('session_compressed', session.sessionDbId, {
           outcome: 'error',
@@ -496,13 +557,18 @@ export class SessionRoutes extends BaseRouteHandler {
         // per-observation request storm the classified path no longer has.
         if (normalizeAbortReason(reason) === 'quota') {
           const quotaMessage = 'Provider reported the inference allowance exhausted';
-          recordQuotaExhausted(provider, quotaMessage, reason?.split(':')[1]);
+          const quotaWindow = reason?.split(':')[1];
+          if (this.tryQuotaRotation(provider, session.sessionDbId, quotaWindow)) {
+            rotatedForQuota = true;
+          } else {
+            recordQuotaExhausted(provider, quotaMessage, quotaWindow);
           // Quota returned as assistant prose never throws, so it never reaches
           // the .catch above and never armed the health ledger. Without this the
           // session-start warning is structurally blind to an entire outage
           // class: the allowance is spent, no observation will ever store, and
           // the user is told nothing.
-          recordObserverFailure(provider, { message: quotaMessage, kind: 'quota_exhausted' });
+            recordObserverFailure(provider, { message: quotaMessage, kind: 'quota_exhausted' });
+          }
         }
         if (reason !== null) {
           // Abort accounting lives HERE, where the reason is consumed — the
@@ -545,6 +611,21 @@ export class SessionRoutes extends BaseRouteHandler {
             void this.ensureGeneratorRunning(session.sessionDbId, 'overflow-recycle')
               .catch(error => {
                 logger.error('SESSION', 'Failed to resume the observer after recycling its conversation', {
+                  sessionId: session.sessionDbId,
+                }, error instanceof Error ? error : new Error(String(error)));
+              });
+          }, 0);
+          resume.unref?.();
+        }
+
+        // A quota refusal that rotated to a healthy pool token resumes like a
+        // recycle: nothing is paused, so the work must not wait for the next
+        // captured tool call. Deferred a tick for the same reason as above.
+        if (rotatedForQuota) {
+          const resume = setTimeout(() => {
+            void this.ensureGeneratorRunning(session.sessionDbId, 'quota-rotate')
+              .catch(error => {
+                logger.error('SESSION', 'Failed to resume the observer after rotating pool tokens', {
                   sessionId: session.sessionDbId,
                 }, error instanceof Error ? error : new Error(String(error)));
               });

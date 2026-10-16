@@ -188,6 +188,34 @@ class OAuthTokenPool {
     );
   }
 
+  /** True when a pool is configured (at least one token loaded). */
+  isConfigured(): boolean {
+    return this.size > 0;
+  }
+
+  /**
+   * Id of the first token not cooling, or undefined when every token is
+   * cooling or the pool is empty. This is the token selectToken() will pick.
+   */
+  firstHealthyId(): string | undefined {
+    this.ensureLoaded();
+    const now = Date.now();
+    return this._entries.find(e => (this._cooldowns.get(e.id) ?? 0) <= now)?.id;
+  }
+
+  /** True if at least one token in the pool is not cooling. */
+  hasHealthyToken(): boolean {
+    return this.firstHealthyId() !== undefined;
+  }
+
+  /** Test seam: drop all cooldown state and the selection. */
+  resetForTests(): void {
+    this._cooldowns.clear();
+    this._lastSelectedId = undefined;
+    this._entries = [];
+    this._loaded = false;
+  }
+
   /**
    * True if every token in the pool has cooldownUntil > now.
    */

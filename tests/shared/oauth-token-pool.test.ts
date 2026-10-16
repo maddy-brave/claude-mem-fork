@@ -3,6 +3,7 @@ import * as fs from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { oauthTokenPool } from '../../src/shared/oauth-token-pool.js';
+import { planPoolRotation, resetPoolRestartGuard, POOL_RESTART_WINDOW_MS } from '../../src/shared/quota-pool-rotation.js';
 
 /**
  * Unit coverage for the multi-subscription OAuth token pool rotation logic.
@@ -144,3 +145,56 @@ function writeAndLoad(name: string, lines: string[]) {
   writeFixture(name, lines);
   return oauthTokenPool.loadPool();
 }
+
+describe('pool-aware quota rotation planning', () => {
+  afterEach(() => {
+    resetPoolRestartGuard();
+  });
+
+  it('reports a healthy token while at least one is not cooling', () => {
+    const entries = writeAndLoad('rot-healthy.tokens', ['sk-rot-healthy-A', 'sk-rot-healthy-B']);
+    expect(oauthTokenPool.isConfigured()).toBe(true);
+    oauthTokenPool.markCooldown(entries[0].id, 'quota_exhausted');
+    expect(oauthTokenPool.hasHealthyToken()).toBe(true);
+    expect(oauthTokenPool.firstHealthyId()).toBe(entries[1].id);
+    oauthTokenPool.markCooldown(entries[1].id, 'quota_exhausted');
+    expect(oauthTokenPool.hasHealthyToken()).toBe(false);
+    expect(oauthTokenPool.firstHealthyId()).toBeUndefined();
+  });
+
+  it('rotates when one of two tokens is cooled', () => {
+    const entries = writeAndLoad('rot-one.tokens', ['sk-rot-one-A', 'sk-rot-one-B']);
+    oauthTokenPool.markCooldown(entries[0].id, 'quota_exhausted');
+    const plan = planPoolRotation();
+    expect(plan.rotate).toBe(true);
+    expect(plan.rotatedToId).toBe(entries[1].id);
+  });
+
+  it('arms the breaker when every token is cooled', () => {
+    const entries = writeAndLoad('rot-all.tokens', ['sk-rot-all-A', 'sk-rot-all-B']);
+    for (const e of entries) oauthTokenPool.markCooldown(e.id, 'quota_exhausted');
+    const plan = planPoolRotation();
+    expect(plan.rotate).toBe(false);
+    expect(plan.reason).toBe('all_exhausted');
+  });
+
+  it('arms the breaker when no pool is configured', () => {
+    process.env.CLAUDE_MEM_OAUTH_TOKENS_FILE = join(tmpRoot, '__nonexistent__');
+    oauthTokenPool.loadPool();
+    const plan = planPoolRotation();
+    expect(plan.rotate).toBe(false);
+    expect(plan.reason).toBe('no_pool');
+  });
+
+  it('trips the restart guard after pool-size restarts in the window', () => {
+    writeAndLoad('rot-guard.tokens', ['sk-rot-guard-A', 'sk-rot-guard-B']);
+    const t0 = 1_000_000;
+    expect(planPoolRotation(t0).rotate).toBe(true);
+    expect(planPoolRotation(t0 + 1).rotate).toBe(true);
+    const tripped = planPoolRotation(t0 + 2);
+    expect(tripped.rotate).toBe(false);
+    expect(tripped.reason).toBe('guard_tripped');
+    // Restarts age out of the window.
+    expect(planPoolRotation(t0 + POOL_RESTART_WINDOW_MS + 2).rotate).toBe(true);
+  });
+});

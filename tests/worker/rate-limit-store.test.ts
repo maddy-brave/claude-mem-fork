@@ -444,3 +444,14 @@ describe('extractRateLimitInfo', () => {
     expect(extractRateLimitInfo({ type: 'rate_limit_event', rate_limit_info: null })).toBeUndefined();
   });
 });
+
+describe('RateLimitStore.clear', () => {
+  it('drops a rejected snapshot so a rotated token is not re-aborted by it', () => {
+    const store = new RateLimitStore();
+    store.set({ status: 'rejected', rateLimitType: 'five_hour', resetsAt: Date.now() + 3_600_000 });
+    expect(shouldAbortForQuota('cli', store).abort).toBe(true);
+    store.clear();
+    expect(store.size).toBe(0);
+    expect(shouldAbortForQuota('cli', store).abort).toBe(false);
+  });
+});

@@ -1,4 +1,10 @@
 import { describe, it, expect, beforeEach, afterEach, afterAll } from 'bun:test';
+import * as fs from 'fs';
+import { join } from 'path';
+import { tmpdir } from 'os';
+import { oauthTokenPool } from '../../src/shared/oauth-token-pool.js';
+import { resetPoolRestartGuard } from '../../src/shared/quota-pool-rotation.js';
+import { getQuotaCooldown, recordQuotaExhausted } from '../../src/shared/quota-cooldown.js';
 import type { ActiveSession } from '../../src/services/worker-types.js';
 import { resetQuotaCooldownsForTesting } from '../../src/shared/quota-cooldown.js';
 import { resetDependencyStatusesForTesting } from '../../src/shared/dependency-health.js';
@@ -8,6 +14,31 @@ const {
   MAX_CONSECUTIVE_STALL_RESUMES,
   RESPONSE_STALL_RESUME_DELAY_MS,
 } = await import('../../src/services/worker/session/response-pacer.js');
+
+// The pool singleton lazily loads the real token file. Point it at a fixture
+// the test writes so no real credentials are ever read.
+const ORIGINAL_TOKENS_FILE = process.env.CLAUDE_MEM_OAUTH_TOKENS_FILE;
+const poolTmpRoot = fs.mkdtempSync(join(tmpdir(), 'quota-rotate-test-'));
+
+function usePool(tokens: string[]): string[] {
+  const file = join(poolTmpRoot, tokens.length === 0 ? '__none__' : `pool-${tokens.length}-${Date.now()}.tokens`);
+  if (tokens.length > 0) fs.writeFileSync(file, tokens.join(String.fromCharCode(10)), 'utf-8');
+  process.env.CLAUDE_MEM_OAUTH_TOKENS_FILE = file;
+  oauthTokenPool.resetForTests();
+  resetPoolRestartGuard();
+  return oauthTokenPool.statusSnapshot().map(e => e.id);
+}
+
+beforeEach(() => {
+  usePool([]);
+});
+
+afterAll(() => {
+  if (ORIGINAL_TOKENS_FILE === undefined) delete process.env.CLAUDE_MEM_OAUTH_TOKENS_FILE;
+  else process.env.CLAUDE_MEM_OAUTH_TOKENS_FILE = ORIGINAL_TOKENS_FILE;
+  oauthTokenPool.resetForTests();
+  try { fs.rmSync(poolTmpRoot, { recursive: true, force: true }); } catch {}
+});
 
 function makeSession(): ActiveSession {
   return {
@@ -255,5 +286,158 @@ describe('observer resumes itself after recycling its conversation (#3800)', () 
       expect(stats().finalizeCalls).toBe(0);
       expect(stats().active).toBe(session);
     });
+  });
+});
+
+describe('quota refusal cools only the exhausted pool token', () => {
+  beforeEach(() => {
+    resetQuotaCooldownsForTesting();
+    resetDependencyStatusesForTesting();
+  });
+
+  afterAll(() => {
+    resetQuotaCooldownsForTesting();
+  });
+
+  async function waitFor(cond: () => boolean, ms = 1000): Promise<void> {
+    const end = Date.now() + ms;
+    while (!cond() && Date.now() < end) await new Promise(r => setTimeout(r, 5));
+  }
+
+  it('one of two tokens exhausted: no breaker, generator restarts on the other token', async () => {
+    const [a] = usePool(['sk-fixture-rotate-A', 'sk-fixture-rotate-B']);
+    const session = makeSession();
+    let starts = 0;
+    const { routes } = buildRoutes(session, async () => {
+      starts += 1;
+      if (starts === 1) {
+        oauthTokenPool.selectToken();
+        oauthTokenPool.markCooldown(a, 'quota_exhausted');
+        session.abortReason = 'quota:five_hour';
+        return;
+      }
+      await new Promise<void>(() => {});
+    });
+
+    await routes.ensureGeneratorRunning(session.sessionDbId, 'observation');
+    await session.generatorPromise;
+    await waitFor(() => starts >= 2);
+
+    expect(starts).toBe(2);
+    expect(getQuotaCooldown('claude')).toBeNull();
+    expect(oauthTokenPool.firstHealthyId()).not.toBe(a);
+  });
+
+  it('one of two tokens exhausted clears a stale breaker for the provider', async () => {
+    const [a] = usePool(['sk-fixture-stale-A', 'sk-fixture-stale-B']);
+    const session = makeSession();
+    let starts = 0;
+    recordQuotaExhausted('claude', 'stale from an earlier refusal', 'five_hour');
+    const { routes } = buildRoutes(session, async () => {
+      starts += 1;
+      if (starts === 1) {
+        oauthTokenPool.selectToken();
+        oauthTokenPool.markCooldown(a, 'quota_exhausted');
+        session.abortReason = 'quota:five_hour';
+        return;
+      }
+      await new Promise<void>(() => {});
+    });
+
+    await routes.ensureGeneratorRunning(session.sessionDbId, 'observation');
+    await session.generatorPromise;
+    await waitFor(() => starts >= 2);
+
+    // The stale breaker did not gate the first start, and none was re-armed.
+    expect(starts).toBe(2);
+    expect(getQuotaCooldown('claude')).toBeNull();
+  });
+
+  it('all tokens exhausted: breaker armed as before and no restart', async () => {
+    const ids = usePool(['sk-fixture-all-A', 'sk-fixture-all-B']);
+    const session = makeSession();
+    let starts = 0;
+    const { routes } = buildRoutes(session, async () => {
+      starts += 1;
+      for (const id of ids) oauthTokenPool.markCooldown(id, 'quota_exhausted');
+      session.abortReason = 'quota:five_hour';
+    });
+
+    await routes.ensureGeneratorRunning(session.sessionDbId, 'observation');
+    await session.generatorPromise;
+    await nextTick();
+
+    expect(starts).toBe(1);
+    expect(getQuotaCooldown('claude')).not.toBeNull();
+  });
+
+  it('no pool configured: old behaviour, breaker armed and no restart', async () => {
+    usePool([]);
+    const session = makeSession();
+    let starts = 0;
+    const { routes } = buildRoutes(session, async () => {
+      starts += 1;
+      session.abortReason = 'quota:five_hour';
+    });
+
+    await routes.ensureGeneratorRunning(session.sessionDbId, 'observation');
+    await session.generatorPromise;
+    await nextTick();
+
+    expect(starts).toBe(1);
+    expect(getQuotaCooldown('claude')).not.toBeNull();
+  });
+
+  it('restart guard trips after pool-size restarts and arms the breaker', async () => {
+    usePool(['sk-fixture-guard-A', 'sk-fixture-guard-B']);
+    const session = makeSession();
+    let starts = 0;
+    // A misclassified refusal: the abort repeats but no token ever cools.
+    const { routes } = buildRoutes(session, async () => {
+      starts += 1;
+      session.abortReason = 'quota:five_hour';
+    });
+
+    await routes.ensureGeneratorRunning(session.sessionDbId, 'observation');
+    await waitFor(() => getQuotaCooldown('claude') !== null);
+    await nextTick();
+
+    // Initial start plus two guarded restarts (pool size 2), then the breaker.
+    expect(starts).toBe(3);
+    expect(getQuotaCooldown('claude')).not.toBeNull();
+  });
+
+  it('a breaker left armed does not block a start while a pool token is healthy', async () => {
+    usePool(['sk-fixture-admit-A', 'sk-fixture-admit-B']);
+    recordQuotaExhausted('claude', 'armed by an earlier run', 'five_hour');
+    const session = makeSession();
+    let starts = 0;
+    const { routes } = buildRoutes(session, async () => {
+      starts += 1;
+      await new Promise<void>(() => {});
+    });
+
+    await routes.ensureGeneratorRunning(session.sessionDbId, 'observation');
+    await nextTick();
+
+    expect(starts).toBe(1);
+    expect(getQuotaCooldown('claude')).toBeNull();
+  });
+
+  it('a breaker stays armed when every pool token is exhausted', async () => {
+    const ids = usePool(['sk-fixture-held-A', 'sk-fixture-held-B']);
+    for (const id of ids) oauthTokenPool.markCooldown(id, 'quota_exhausted');
+    recordQuotaExhausted('claude', 'armed by an earlier run', 'five_hour');
+    const session = makeSession();
+    let starts = 0;
+    const { routes } = buildRoutes(session, async () => {
+      starts += 1;
+    });
+
+    await routes.ensureGeneratorRunning(session.sessionDbId, 'observation');
+    await nextTick();
+
+    expect(starts).toBe(0);
+    expect(getQuotaCooldown('claude')).not.toBeNull();
   });
 });

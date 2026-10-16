@@ -72,6 +72,7 @@ bring the fork forward without re-introducing already-fixed bugs.
   signature patch, removes four rows that were already upstream, and adds the port-reclaim
   composition (see "Patch inventory"). Merge the TAG, not `upstream/main`, which was 233
   commits past it.
+- `v13.28.0-fork.3` — skill trim on `stable-v13.28.0` (2026-10-16). Deletes 17 plugin skills and keeps `babysit`, `knowledge-agent`, `mem-search`, `smart-explore`. Deleted: agent-cost-report, ccs-align, cloud-sync, design-is, do, how-it-works, learn-codebase, make-plan, mode-creator, oh-my-issues, pathfinder, standup, timeline-report, version-bump, weekly-digests, what-the, wowerpoint. KEEP: every future upstream merge must classify modify/delete conflicts on these directories and on any new upstream skill.
 - `v13.28.0-fork.2` — patch release on `stable-v13.28.0` (2026-10-10). Adds the `pydantic<2.12`
   runtime pin to `CHROMA_MCP_DEP_OVERRIDES` in `src/services/sync/ChromaMcpManager.ts`, so the
   chroma-mcp 0.2.6 prewarm no longer dies with an ImportError on pydantic 2.14. Verified with

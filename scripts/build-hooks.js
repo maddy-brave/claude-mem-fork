@@ -753,15 +753,6 @@ async function buildHooks() {
       console.log(`✓ opencode plugin built (${(opencodeStats.size / 1024).toFixed(2)} KB)`);
     }
 
-    console.log('\n📋 Copying onboarding explainer to plugin tree...');
-    const onboardingExplainerSrc = 'src/services/worker/onboarding-explainer.md';
-    const onboardingExplainerDst = 'plugin/skills/how-it-works/onboarding-explainer.md';
-    if (!fs.existsSync(onboardingExplainerSrc)) {
-      throw new Error(`Missing onboarding explainer source: ${onboardingExplainerSrc}`);
-    }
-    fs.mkdirSync(path.dirname(onboardingExplainerDst), { recursive: true });
-    fs.copyFileSync(onboardingExplainerSrc, onboardingExplainerDst);
-    console.log(`✓ Copied ${onboardingExplainerSrc} → ${onboardingExplainerDst}`);
 
     console.log('\n📋 Verifying distribution files...');
     const validCodexHookEvents = new Set([
@@ -774,12 +765,7 @@ async function buildHooks() {
     ]);
     const requiredDistributionFiles = [
       'plugin/skills/mem-search/SKILL.md',
-      'plugin/skills/mode-creator/SKILL.md',
-      'plugin/skills/mode-creator/scripts/install-mode.mjs',
-      'plugin/skills/mode-creator/scripts/configure-telegram.mjs',
       'plugin/skills/smart-explore/SKILL.md',
-      'plugin/skills/how-it-works/SKILL.md',
-      'plugin/skills/how-it-works/onboarding-explainer.md',
       'plugin/hooks/hooks.json',
       'plugin/hooks/codex-hooks.json',
       'plugin/scripts/bun-runner.js',

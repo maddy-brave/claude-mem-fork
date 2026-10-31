@@ -6,21 +6,21 @@ top of a tagged upstream base. This file is the single source of truth during an
 upstream rebase: what each patch is for, whether upstream now covers it, and how to
 bring the fork forward without re-introducing already-fixed bugs.
 
-## Current line: 15.7.0-fork.1 (2026-11-01)
+## Current line: 15.7.0-fork.2 (2026-11-01)
 
 `stable-v15.7.0` is upstream tag `v15.7.0` (commit `35d855784`) plus the smallest patch set,
 built fresh from the tag, not merged from `stable-v13.28.0`. Every behaviour that can be a
 settings key, a reapply rule on the cached plugin files, a guard script or an additive file
 lives outside the source tree. Rollback tag for the previous line is
-`rollback/2026-10-31-pre-v15.7.0-rebase` at `3b4bbbf2d`. Annotated tag `v15.7.0-fork.1` sits
-on the branch head. The older `stable-v13.28.0` line below is kept as the rollback record and
+`rollback/2026-10-31-pre-v15.7.0-rebase` at `3b4bbbf2d`. Annotated tag `v15.7.0-fork.2` sits
+on the branch head; `v15.7.0-fork.1` stays in place one commit earlier. The older `stable-v13.28.0` line below is kept as the rollback record and
 its patch inventory is historical.
 
 Branch strategy for the next rebase: create the new branch from the new upstream tag,
 cherry-pick the source commits of this line in order (additive files, call-site patches,
 dependency overrides, version bump), then rebuild the bundles. Never hand-merge bundles.
 
-### Patch table at 15.7.0-fork.1
+### Patch table at 15.7.0-fork.2
 
 | Patch | Status | Where |
 |---|---|---|
@@ -31,11 +31,11 @@ dependency overrides, version bump), then rebuild the bundles. Never hand-merge 
 | P3 lazy-spawn `sanitizeEnv` | Retired | `CLAUDE_MEM_WORKER_AUTOSTART=false`, guard sanitises the spawn env |
 | P6 D4 batch and cap | Retired | Dormant in live settings |
 | P7 identity mismatch warning | Retired | Guard compares `/api/health` `workerPath` |
-| P8 bun 1.3.13 `unref` workaround | Not carried | Test in T7 first; upstream still has `deadlineTimer.unref?.()` |
+| P8 bun 1.3.13 `unref` workaround | Carried at 15.7.0-fork.2 | `src/services/worker-shutdown.ts`. T7 proved the unref'd deadline timer never fires on bun 1.3.13 on Windows, so shutdown hangs. The fork drops `deadlineTimer.unref?.()` and keeps an explanatory comment. Take only this hunk; the other fork.5 hunks revert upstream idle-exit work |
 | P9, P10, P12 | Retired | Test and merge-conflict helpers only |
 | P11 DB management scripts | Carried | `scripts/batch-import-from-db.ts`, `scripts/dump-backup-to-import-json.ts` |
 | P13 fork tooling and docs | Carried | This file only. The cozempic `.claude/settings.json` and the `.gitignore` additions are dropped; the `hardened-options.ts` comment is dropped |
-| P14 version strings and bundles | Carried | `15.7.0-fork.1` in the 8 manifests of RUN Step 2a, plus the manifests `scripts/sync-plugin-manifests.js` writes from `package.json`, then bundles rebuilt |
+| P14 version strings and bundles | Carried | `15.7.0-fork.2` in the 8 manifests of RUN Step 2a, plus the manifests `scripts/sync-plugin-manifests.js` writes from `package.json`, then bundles rebuilt |
 | P15 chroma pydantic pin | Not carried | Upstream `<2.14`; T7 prewarm test decides whether a fork pin returns |
 | D1 dependency overrides | Carried | `package.json`, `plugin/package.json` and the generator in `scripts/build-hooks.js`: shell-quote, dompurify, proxy-addr, hono, zod, fast-uri, esbuild, minimatch from fork.5, plus `adm-zip >=0.6.1` for the onnxruntime-node chain. `bun audit` reports no vulnerabilities at root and in `plugin/` |
 | S1 skill trim | Rule | Reapply rule, not a source patch |

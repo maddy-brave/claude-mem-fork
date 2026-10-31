@@ -486,7 +486,7 @@ async function buildHooks() {
         // Native decoder must remain external and be installed for each host.
         // https://sharp.pixelplumbing.com/install/#bundlers
         'sharp': packageJson.dependencies.sharp,
-        'zod': '^4.4.3',
+        'zod': '^4.6.6',
         // Exact, not a range: the worker only installs a tree-sitter executable
         // whose SHA-256 is pinned for this version
         // (src/services/smart-file-read/tree-sitter-cli-checksums.ts), and an
@@ -516,7 +516,7 @@ async function buildHooks() {
         '@tree-sitter-grammars/tree-sitter-yaml': '^0.7.1',
         '@derekstride/tree-sitter-sql': '^0.3.11',
         '@tree-sitter-grammars/tree-sitter-markdown': '^0.3.2',
-        'shell-quote': '1.9.0',
+        'shell-quote': '^1.11.0',
       },
       // The server's embedder, about 300 MB, which only server mode runs. The
       // plugin install omits optional dependencies (installPluginDependencies),
@@ -538,6 +538,9 @@ async function buildHooks() {
       },
       overrides: {
         'tree-sitter': '^0.25.0',
+        'shell-quote': '>=1.11.0',
+        'zod': '>=4.6.6',
+        'adm-zip': '>=0.6.1',
         // MUST live here, not only in the root package.json. npm/bun apply
         // `overrides` ONLY in the project being installed, so the root override is
         // invisible to users; plugin/ is its own install root (own package.json +

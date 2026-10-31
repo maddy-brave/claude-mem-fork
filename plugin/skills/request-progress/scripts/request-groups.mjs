@@ -2499,6 +2499,188 @@ var init_api_key_pool = __esm({
   }
 });
 
+// src/shared/oauth-token-pool.ts
+import { existsSync as existsSync9, readFileSync as readFileSync7 } from "fs";
+import { join as join8 } from "path";
+import { createHash } from "crypto";
+function deriveId(token) {
+  return createHash("sha256").update(token).digest("hex").slice(0, 12);
+}
+function parseTokenFile(filePath) {
+  let raw;
+  try {
+    raw = readFileSync7(filePath, "utf-8");
+  } catch {
+    return [];
+  }
+  const seen = /* @__PURE__ */ new Set();
+  const entries = [];
+  for (const line of raw.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    let tokenValue;
+    const colonIdx = trimmed.indexOf(":");
+    if (colonIdx > 0) {
+      const beforeColon = trimmed.slice(0, colonIdx);
+      if (beforeColon.length > 0 && !/\s/.test(beforeColon)) {
+        tokenValue = trimmed.slice(colonIdx + 1).trim();
+      } else {
+        tokenValue = trimmed;
+      }
+    } else {
+      tokenValue = trimmed;
+    }
+    if (!tokenValue) continue;
+    if (!seen.has(tokenValue)) {
+      seen.add(tokenValue);
+      entries.push({ id: deriveId(tokenValue), token: tokenValue });
+    }
+  }
+  return entries;
+}
+var DEFAULT_COOLDOWN_MS, OAuthTokenPool, oauthTokenPool;
+var init_oauth_token_pool = __esm({
+  "src/shared/oauth-token-pool.ts"() {
+    "use strict";
+    init_paths();
+    init_logger();
+    DEFAULT_COOLDOWN_MS = {
+      rate_limit: 15 * 6e4,
+      // 15 min
+      quota_exhausted: 60 * 6e4,
+      // 1 h
+      auth_invalid: 6 * 60 * 6e4
+      // 6 h (treat as likely-dead)
+    };
+    OAuthTokenPool = class {
+      _entries = [];
+      _cooldowns = /* @__PURE__ */ new Map();
+      // id -> cooldownUntilMs
+      _lastSelectedId;
+      _loaded = false;
+      /** Reload the token file from disk. Called lazily on first access. */
+      loadPool() {
+        const filePath = process.env.CLAUDE_MEM_OAUTH_TOKENS_FILE ?? join8(paths.dataDir(), ".oauth_tokens");
+        if (!existsSync9(filePath)) {
+          this._entries = [];
+          this._loaded = true;
+          return [];
+        }
+        this._entries = parseTokenFile(filePath);
+        this._loaded = true;
+        if (this._entries.length > 0) {
+          logger.info("OAUTH", `Token pool loaded: ${this._entries.length} token(s)`, {
+            ids: this._entries.map((e) => e.id)
+          });
+        }
+        return this._entries;
+      }
+      ensureLoaded() {
+        if (!this._loaded) this.loadPool();
+      }
+      /** Pool size (entry count). */
+      get size() {
+        this.ensureLoaded();
+        return this._entries.length;
+      }
+      /** The id of the most-recently selected token. */
+      get lastSelectedId() {
+        return this._lastSelectedId;
+      }
+      /**
+       * Select the first token whose cooldown has expired.
+       * If ALL tokens are on cooldown, return the one with the soonest
+       * cooldownUntil (still attempt — better than a hard fail).
+       * Returns undefined only when the pool is empty.
+       */
+      selectToken() {
+        this.ensureLoaded();
+        if (this._entries.length === 0) return void 0;
+        const now = Date.now();
+        const healthy = this._entries.filter(
+          (e) => (this._cooldowns.get(e.id) ?? 0) <= now
+        );
+        let selected;
+        if (healthy.length > 0) {
+          selected = healthy[0];
+        } else {
+          selected = this._entries.reduce((best, cur) => {
+            const bestUntil = this._cooldowns.get(best.id) ?? 0;
+            const curUntil = this._cooldowns.get(cur.id) ?? 0;
+            return curUntil < bestUntil ? cur : best;
+          });
+        }
+        this._lastSelectedId = selected.id;
+        return selected;
+      }
+      /**
+       * Mark a token on cooldown. retryAfterMs overrides the default when the
+       * error surface carries a retry-after hint.
+       */
+      markCooldown(id, kind, retryAfterMs) {
+        const duration = retryAfterMs ?? DEFAULT_COOLDOWN_MS[kind];
+        const until = Date.now() + duration;
+        this._cooldowns.set(id, until);
+        logger.info("OAUTH", `Pool token cooled: id=${id} kind=${kind} cooldownUntil=${new Date(until).toISOString()}`);
+      }
+      /**
+       * True if at least one token OTHER than lastSelectedId has cooldownUntil <= now.
+       * Used by ClaudeProvider to decide whether rotation is worth attempting.
+       */
+      hasAnotherHealthyToken() {
+        this.ensureLoaded();
+        if (this._entries.length <= 1) return false;
+        const now = Date.now();
+        return this._entries.some(
+          (e) => e.id !== this._lastSelectedId && (this._cooldowns.get(e.id) ?? 0) <= now
+        );
+      }
+      /** True when a pool is configured (at least one token loaded). */
+      isConfigured() {
+        return this.size > 0;
+      }
+      /**
+       * Id of the first token not cooling, or undefined when every token is
+       * cooling or the pool is empty. This is the token selectToken() will pick.
+       */
+      firstHealthyId() {
+        this.ensureLoaded();
+        const now = Date.now();
+        return this._entries.find((e) => (this._cooldowns.get(e.id) ?? 0) <= now)?.id;
+      }
+      /** True if at least one token in the pool is not cooling. */
+      hasHealthyToken() {
+        return this.firstHealthyId() !== void 0;
+      }
+      /** Test seam: drop all cooldown state and the selection. */
+      resetForTests() {
+        this._cooldowns.clear();
+        this._lastSelectedId = void 0;
+        this._entries = [];
+        this._loaded = false;
+      }
+      /**
+       * True if every token in the pool has cooldownUntil > now.
+       */
+      allExhausted() {
+        this.ensureLoaded();
+        if (this._entries.length === 0) return false;
+        const now = Date.now();
+        return this._entries.every((e) => (this._cooldowns.get(e.id) ?? 0) > now);
+      }
+      /** Expose entries (without raw tokens) for diagnostics. */
+      statusSnapshot() {
+        this.ensureLoaded();
+        return this._entries.map((e) => ({
+          id: e.id,
+          cooldownUntil: this._cooldowns.get(e.id)
+        }));
+      }
+    };
+    oauthTokenPool = new OAuthTokenPool();
+  }
+});
+
 // src/shared/oauth-token.ts
 import { execFile } from "child_process";
 import { promisify } from "util";
@@ -2509,12 +2691,13 @@ var init_oauth_token = __esm({
     init_paths();
     init_SettingsDefaultsManager();
     init_logger();
+    init_oauth_token_pool();
     execFileAsync = promisify(execFile);
   }
 });
 
 // src/shared/EnvManager.ts
-import { existsSync as existsSync9, readFileSync as readFileSync7, writeFileSync as writeFileSync2, mkdirSync as mkdirSync4, chmodSync } from "fs";
+import { existsSync as existsSync10, readFileSync as readFileSync8, writeFileSync as writeFileSync2, mkdirSync as mkdirSync4, chmodSync } from "fs";
 import { parseEnv as parseEnv2 } from "util";
 function envFilePath() {
   return process.env.CLAUDE_MEM_ENV_FILE ?? paths.envFile();
@@ -2524,11 +2707,11 @@ function parseEnvFile(content) {
 }
 function loadClaudeMemEnv() {
   const envFile = envFilePath();
-  if (!existsSync9(envFile)) {
+  if (!existsSync10(envFile)) {
     return {};
   }
   try {
-    const content = readFileSync7(envFile, "utf-8");
+    const content = readFileSync8(envFile, "utf-8");
     const parsed = parseEnvFile(content);
     const result = {};
     for (const key of CREDENTIAL_KEYS) {
@@ -2645,7 +2828,7 @@ __export(request_judge_exports, {
   routeUndecided: () => routeUndecided,
   rulesJudge: () => rulesJudge
 });
-import { join as join8 } from "node:path";
+import { join as join9 } from "node:path";
 function bandFor(confidence) {
   if (!Number.isFinite(confidence)) throw new TypeError(`A judge's confidence must be a number, got ${confidence}.`);
   return confidence >= JOIN_THRESHOLD ? "join" : confidence >= SUGGEST_THRESHOLD ? "suggest" : "new";
@@ -2779,7 +2962,7 @@ async function routeUndecided({ dir = LEDGER_DIR, database, judge = null, now = 
   const routed = [], unplaced = [];
   let working = ledger.groups;
   const persist = () => {
-    if (apply) writeJsonAtomic(join8(dir, "request-groups.json"), working);
+    if (apply) writeJsonAtomic(join9(dir, "request-groups.json"), working);
   };
   for (; ; ) {
     const input = groupingInput({ ...ledger, groups: working }, database, { sinceEpoch, limit: Infinity, skip });
@@ -2892,7 +3075,7 @@ function decideSuggestion({ dir, database, conversationKey: conversationKey2, ac
     next.suggestions = { ...next.suggestions ?? {}, [conversationKey2]: { ...suggestion, status: "declined", resolvedAt: iso2(now), evidence: `Owner declined: not part of "${request?.title ?? suggestion.requestId}". ${suggestion.evidence}` } };
     next.updatedAt = iso2(now);
   }
-  writeJsonAtomic(join8(dir, "request-groups.json"), next);
+  writeJsonAtomic(join9(dir, "request-groups.json"), next);
   return { status: next.suggestions[conversationKey2].status, requestId: next.conversations[conversationKey2] ?? null };
 }
 var DAY_MS, iso2, JOIN_THRESHOLD, SUGGEST_THRESHOLD, MAX_CANDIDATE_REQUESTS, MAX_DECISION_BODY_BYTES, DECISION_TIMEOUT_MS, JEV_MODEL, OPENROUTER_DECISIONS_URL, CONTEXT_PROMPTS, CONTEXT_PROMPT_CHARS, CONTEXT_RECORDED_TITLES, CONTEXT_TITLE_CHARS, PICK_INSTRUCTIONS, CHECK_INSTRUCTIONS, CHECK_CRITERIA, clean, rulesJudge;
@@ -2940,10 +3123,10 @@ var init_request_judge = __esm({
 
 // src/services/work-view/request-groups.mjs
 import { Database } from "bun:sqlite";
-import { createHash } from "node:crypto";
-import { mkdirSync as mkdirSync5, readFileSync as readFileSync8, readdirSync, renameSync as renameSync2, statSync as statSync5, writeFileSync as writeFileSync3 } from "node:fs";
+import { createHash as createHash2 } from "node:crypto";
+import { mkdirSync as mkdirSync5, readFileSync as readFileSync9, readdirSync, renameSync as renameSync2, statSync as statSync5, writeFileSync as writeFileSync3 } from "node:fs";
 import { homedir as homedir7 } from "node:os";
-import { join as join9 } from "node:path";
+import { join as join10 } from "node:path";
 function placeholders(values) {
   return values.map(() => "?").join(",");
 }
@@ -3089,14 +3272,14 @@ function readGoals(database) {
 }
 function readJson(path3, fallback) {
   try {
-    return JSON.parse(readFileSync8(path3, "utf8"));
+    return JSON.parse(readFileSync9(path3, "utf8"));
   } catch (error) {
     if (error.code === "ENOENT") return fallback;
     throw error;
   }
 }
 function writeJsonAtomic(path3, value) {
-  mkdirSync5(join9(path3, ".."), { recursive: true });
+  mkdirSync5(join10(path3, ".."), { recursive: true });
   const temp = `${path3}.tmp`;
   writeFileSync3(temp, `${JSON.stringify(value, null, 2)}
 `, { mode: 384 });
@@ -3323,24 +3506,24 @@ function validateStory(story) {
   };
 }
 function readLedger(dir = LEDGER_DIR) {
-  const groups = readJson(join9(dir, "request-groups.json"), emptyGroups());
+  const groups = readJson(join10(dir, "request-groups.json"), emptyGroups());
   const progress = {};
   let names = [];
   try {
-    names = readdirSync(join9(dir, "progress")).filter((name) => /^g_[0-9a-f]{12}\.json$/.test(name));
+    names = readdirSync(join10(dir, "progress")).filter((name) => /^g_[0-9a-f]{12}\.json$/.test(name));
   } catch (error) {
     if (error.code !== "ENOENT") throw error;
   }
   for (const name of names) {
-    const entry = readJson(join9(dir, "progress", name), null);
+    const entry = readJson(join10(dir, "progress", name), null);
     if (entry?.groupId && groups.groups[entry.groupId]) progress[entry.groupId] = { ...entry, title: groups.groups[entry.groupId].title };
   }
   return {
     groups,
     progress,
-    story: readJson(join9(dir, "story.json"), null),
-    refresh: readJson(join9(dir, "refresh.json"), null),
-    agentWrittenPromptIds: new Set(readJson(join9(dir, AGENT_WRITTEN_PROMPTS_FILE), { promptIds: [] }).promptIds ?? [])
+    story: readJson(join10(dir, "story.json"), null),
+    refresh: readJson(join10(dir, "refresh.json"), null),
+    agentWrittenPromptIds: new Set(readJson(join10(dir, AGENT_WRITTEN_PROMPTS_FILE), { promptIds: [] }).promptIds ?? [])
   };
 }
 function groupDetails(groupId, ledger, candidatesByKey) {
@@ -3394,7 +3577,7 @@ function requestRecord(ledger, groupId, asks) {
 }
 function focusBasis(ledger, groupId) {
   const group = ledger.groups.groups[groupId];
-  return createHash("sha256").update(JSON.stringify({ title: group.title, firstAsk: group.anchorAsk?.text ?? null, conversations: groupConversations(ledger, groupId) })).digest("hex").slice(0, 16);
+  return createHash2("sha256").update(JSON.stringify({ title: group.title, firstAsk: group.anchorAsk?.text ?? null, conversations: groupConversations(ledger, groupId) })).digest("hex").slice(0, 16);
 }
 function focusDue(ledger, focus, localDeviceId2) {
   return Object.keys(ledger.groups.groups).filter((groupId) => {
@@ -3507,7 +3690,7 @@ function refreshNeeds({ dir = LEDGER_DIR, database, now = Date.now(), days = 14,
   return { due: due.length, ungrouped, goalsStale, unplaced: queued.length, otherChanged, needed: Boolean(due.length || ungrouped || goalsStale || queued.length || otherChanged) };
 }
 function readInput(source) {
-  return JSON.parse(readFileSync8(source === "-" ? 0 : source, "utf8"));
+  return JSON.parse(readFileSync9(source === "-" ? 0 : source, "utf8"));
 }
 function textOption(args, name) {
   const index = args.indexOf(`--${name}`);
@@ -3521,7 +3704,7 @@ function option(args, name, fallback) {
   return value;
 }
 function openDatabase() {
-  const path3 = process.env.CLAUDE_MEM_DB ?? join9(DATA_DIR2, "claude-mem.db");
+  const path3 = process.env.CLAUDE_MEM_DB ?? join10(DATA_DIR2, "claude-mem.db");
   statSync5(path3);
   const database = new Database(path3, { readonly: true, create: false });
   database.exec("PRAGMA busy_timeout = 1500");
@@ -3605,7 +3788,7 @@ function runCli(argv, { dir = LEDGER_DIR, database = null, now = Date.now(), pri
   if (command === "apply") {
     const ledger = readLedger(dir);
     const next = applyDecisions(ledger.groups, readInput(args[0] ?? "-"), { database: db(), now, excludedPromptIds: ledger.agentWrittenPromptIds });
-    writeJsonAtomic(join9(dir, "request-groups.json"), next);
+    writeJsonAtomic(join10(dir, "request-groups.json"), next);
     return print2({ groups: Object.keys(next.groups).length, conversations: Object.keys(next.conversations).length });
   }
   if (command === "pending" || command === "show") {
@@ -3642,7 +3825,7 @@ function runCli(argv, { dir = LEDGER_DIR, database = null, now = Date.now(), pri
     const previous = ledger.progress[reviewed.groupId];
     const unchanged = previous && JSON.stringify(storyFacts(previous)) === JSON.stringify(storyFacts(reviewed));
     const entry = { ...reviewed, checkedAt, changedAt: unchanged ? previous.changedAt ?? previous.checkedAt : checkedAt, readings: appendReading(ledger.progress[reviewed.groupId], { at: checkedAt, percent: reviewed.percent }) };
-    writeJsonAtomic(join9(dir, "progress", `${entry.groupId}.json`), entry);
+    writeJsonAtomic(join10(dir, "progress", `${entry.groupId}.json`), entry);
     return print2({ recorded: entry.groupId, state: entry.state, percent: entry.percent, readings: entry.readings.length });
   }
   if (command === "story-input") {
@@ -3671,7 +3854,7 @@ function runCli(argv, { dir = LEDGER_DIR, database = null, now = Date.now(), pri
     const validated = validateStory(readInput(args[0] ?? "-"));
     const fromOwnerGoals = (readLedger(dir).story?.preferences ?? []).filter((preference) => preference?.source === OWNER_GOALS_LIST);
     const story = { ...validated, preferences: [...validated.preferences, ...fromOwnerGoals], writtenAt: iso3(now) };
-    writeJsonAtomic(join9(dir, "story.json"), story);
+    writeJsonAtomic(join10(dir, "story.json"), story);
     return print2({ recorded: "story", preferences: story.preferences.length });
   }
   const focusQuestion = () => {
@@ -3698,8 +3881,8 @@ var init_request_groups = __esm({
     init_owner_goals();
     init_session_project();
     init_my_focus();
-    DATA_DIR2 = process.env.CLAUDE_MEM_DATA_DIR || join9(homedir7(), ".claude-mem");
-    LEDGER_DIR = join9(DATA_DIR2, "work-view");
+    DATA_DIR2 = process.env.CLAUDE_MEM_DATA_DIR || join10(homedir7(), ".claude-mem");
+    LEDGER_DIR = join10(DATA_DIR2, "work-view");
     AGENT_WRITTEN_PROMPTS_FILE = "agent-written-prompts.json";
     DAY_MS2 = 864e5;
     GOALS_STALE_MS = DAY_MS2;
@@ -3711,7 +3894,7 @@ var init_request_groups = __esm({
     LINK_KINDS = ["shared-work-list", "shared-request-id", "agent-judgment", "judge"];
     MAX_READINGS = 20;
     iso3 = (epoch) => Number.isFinite(epoch) && epoch > 0 ? new Date(epoch).toISOString() : null;
-    groupIdFor = (anchorConversationKey) => `g_${createHash("sha256").update(anchorConversationKey).digest("hex").slice(0, 12)}`;
+    groupIdFor = (anchorConversationKey) => `g_${createHash2("sha256").update(anchorConversationKey).digest("hex").slice(0, 12)}`;
     emptyGroups = () => ({ version: 1, updatedAt: null, conversations: {}, groups: {}, ignored: {} });
     isIsoOrNull = (value) => value === null || typeof value === "string" && Number.isFinite(Date.parse(value));
     evidenceList = (value, limit = 8) => (Array.isArray(value) ? value : typeof value === "string" && value.trim() ? [value] : []).map(String).slice(0, limit);
@@ -3728,7 +3911,7 @@ var init_request_groups = __esm({
       const asks = openingAsks(database, ledger, groupIds.flatMap((groupId) => groupConversations(ledger, groupId)));
       return groupIds.map((groupId) => requestRecord(ledger, groupId, asks));
     };
-    otherPassHash = (ledger, groupIds) => groupIds.length ? createHash("sha256").update(JSON.stringify(groupIds.map((groupId) => [ledger.groups.groups[groupId].anchor, focusBasis(ledger, groupId)]).sort())).digest("hex").slice(0, 16) : null;
+    otherPassHash = (ledger, groupIds) => groupIds.length ? createHash2("sha256").update(JSON.stringify(groupIds.map((groupId) => [ledger.groups.groups[groupId].anchor, focusBasis(ledger, groupId)]).sort())).digest("hex").slice(0, 16) : null;
     focusAreaRecord = (area) => ({ focusAreaId: area.focusAreaId, name: area.name, goal: area.goal, about: area.about, status: area.status });
     AREA_NAME_MAX = 80;
     AREA_SENTENCE_MAX = 300;
@@ -3743,7 +3926,7 @@ var init_request_groups = __esm({
 });
 
 // src/services/work-view/request-groups-cli.mjs
-import { join as join10 } from "node:path";
+import { join as join11 } from "node:path";
 
 // src/integrations/harness-worker.ts
 import { existsSync, readFileSync } from "node:fs";
@@ -3787,7 +3970,7 @@ async function saveFocus(body) {
   if (!response.ok) throw new Error(`worker refused /api/work-view/focus/router: ${response.status} ${text2}`);
   return JSON.parse(text2);
 }
-var localDeviceId = SettingsDefaultsManager.loadFromFile(join10(resolveDataDir(), "settings.json"), true, { readOnly: true }).CLAUDE_MEM_CLOUD_SYNC_DEVICE_ID ?? "";
+var localDeviceId = SettingsDefaultsManager.loadFromFile(join11(resolveDataDir(), "settings.json"), true, { readOnly: true }).CLAUDE_MEM_CLOUD_SYNC_DEVICE_ID ?? "";
 var output = "";
 var print = (value) => {
   output += `${JSON.stringify(value, null, 2)}

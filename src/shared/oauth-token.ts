@@ -18,6 +18,7 @@ import { join } from 'path';
 import { paths, CLAUDE_CONFIG_DIR, DEFAULT_CLAUDE_CONFIG_DIR, expandTilde } from './paths.js';
 import { SettingsDefaultsManager } from './SettingsDefaultsManager.js';
 import { logger } from '../utils/logger.js';
+import { oauthTokenPool, type CooldownKind, DEFAULT_COOLDOWN_MS } from './oauth-token-pool.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -148,8 +149,34 @@ export function deriveMacKeychainServiceName(profile: ClaudeCredentialProfile): 
 // a small grace covers clock skew and refresh-in-progress windows.
 const EXPIRY_GRACE_MS = 60_000;
 
+// FORK P4: keychain / env-token cooldown and last-selection state used by pool rotation.
+/** When > Date.now(), the stored/env token is on cooldown and must be bypassed. */
+let keychainCooldownUntil = 0;
+
+/** Source of the most recently returned token, read by ClaudeProvider and quota-pool-rotation. */
+let lastSelection: { source: 'keychain' | 'env-fallback' | 'file-fallback'; poolId?: string } | undefined;
+
+function isKeychainCooling(): boolean {
+  return Date.now() < keychainCooldownUntil;
+}
+
+/** Cool the stored/env token so the next read falls through to the pool. Never logs token values. */
+export function markKeychainCooldown(kind: CooldownKind, retryAfterMs?: number): void {
+  const duration = retryAfterMs ?? DEFAULT_COOLDOWN_MS[kind];
+  keychainCooldownUntil = Date.now() + duration;
+  logger.info('OAUTH', `Keychain/env token cooled: kind=${kind} cooldownUntil=${new Date(keychainCooldownUntil).toISOString()}`);
+}
+
+export function clearKeychainCooldown(): void {
+  keychainCooldownUntil = 0;
+}
+
+export function getLastTokenSelection(): typeof lastSelection {
+  return lastSelection;
+}
+
 export type OAuthTokenResult =
-  | { kind: 'present'; token: string; source: 'keychain' | 'env-fallback' | 'credentials-file'; expiresAt?: number }
+  | { kind: 'present'; token: string; source: 'keychain' | 'env-fallback' | 'credentials-file' | 'file-fallback'; expiresAt?: number; poolId?: string }
   | { kind: 'expired'; reason: string; expiresAt?: number }
   | { kind: 'absent'; reason: string };
 
@@ -632,9 +659,28 @@ export async function readClaudeOAuthToken(
   const credentialProfile = resolveClaudeCredentialProfile(settings.CLAUDE_MEM_CLAUDE_CONFIG_DIR);
 
   const storedResult = await readStoredClaudeCredential(credentialProfile, execImpl);
-  if (storedResult.kind === 'present') return storedResult;
+  // FORK P4: a present stored token wins unless it is cooling after a quota refusal.
+  if (storedResult.kind === 'present' && !isKeychainCooling()) {
+    lastSelection = { source: 'keychain' };
+    return storedResult;
+  }
 
   const envResult = readEnvOAuthToken();
+  if (envResult.kind === 'present' && !isKeychainCooling()) {
+    lastSelection = { source: 'env-fallback' };
+    return envResult;
+  }
+
+  // FORK P4: file token pool after stored and env sources. selectToken() returns the
+  // first healthy entry, or the soonest-recovering one when all are cooling.
+  const poolSel = oauthTokenPool.selectToken();
+  if (poolSel) {
+    lastSelection = { source: 'file-fallback', poolId: poolSel.id };
+    return { kind: 'present', token: poolSel.token, source: 'file-fallback', poolId: poolSel.id };
+  }
+
+  // Pool empty: a cooling stored or env token is still better than nothing.
+  if (storedResult.kind === 'present') return storedResult;
   if (envResult.kind === 'present') return envResult;
 
   if (storedResult.kind === 'expired') return storedResult;

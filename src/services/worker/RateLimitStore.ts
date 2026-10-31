@@ -234,6 +234,16 @@ export class RateLimitStore {
   }
 
   /**
+   * WINDOWS-FORK (P4): drop every snapshot and rejection. The store is not keyed
+   * by pool token, so after the active token is cooled and the session rotates,
+   * the old token's rejected snapshots would re-abort the new token's first request.
+   */
+  clear(): void {
+    this.entries.clear();
+    this.rejections.clear();
+  }
+
+  /**
    * Tests only: put a bucket back exactly as it was before a case touched the
    * process-wide store — the saved entry, or no entry (and no rejection) at all.
    */

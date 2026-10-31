@@ -27,6 +27,7 @@ import { USER_SETTINGS_PATH, ensureObserverSessionsDir } from '../../../../share
 import { getProjectContext, isProjectKeySource } from '../../../../utils/project-name.js';
 import { isProjectExcluded } from '../../../../utils/project-filter.js';
 import { startGeneratorWithProvider } from '../../session/GeneratorRunner.js';
+import { oauthTokenPool } from '../../../../shared/oauth-token-pool.js';
 import { captureEvent } from '../../../telemetry/telemetry.js';
 import { recordWorkStatePrompt, recordWorkStatePrivacy } from '../../../telemetry/work-state.js';
 import { firstPartySkillFromSlashPrompt } from '../../../telemetry/skill-id.js';
@@ -47,6 +48,7 @@ import { findClaudeExecutable, isClaudeExecutableUnspawnable } from '../../../..
 import {
   tryAdmitQuotaProbe,
   releaseQuotaProbe,
+  clearQuotaCooldown,
   getQuotaCooldown,
   isQuotaCooldownActive,
   cooldownAppliesToCurrentAccount,
@@ -508,6 +510,21 @@ export class SessionRoutes extends BaseRouteHandler {
       // Claim the probe rather than merely reading the clock: every live session
       // sees the window elapse at the same instant, so a bare check would let
       // them all through together.
+      // WINDOWS-FORK (P4): a breaker left over from a single token's refusal must
+      // not hold the provider shut while another pool token is healthy.
+      if (
+        selectedProvider === 'claude' &&
+        getQuotaCooldown(selectedProvider) &&
+        oauthTokenPool.hasHealthyToken()
+      ) {
+        clearQuotaCooldown(selectedProvider);
+        logger.warn('SESSION', 'Cleared the provider quota breaker because a healthy pool token exists', {
+          sessionId: sessionDbId,
+          source,
+          provider: selectedProvider,
+          healthyTokenId: oauthTokenPool.firstHealthyId(),
+        });
+      }
       const admission = tryAdmitQuotaProbe(selectedProvider);
       // The primary Claude credential is held: run on the quota-fallback one
       // (dispatch logs the switch). No probe claim is taken; the primary's own

@@ -33,7 +33,9 @@ import {
   recordCodexCliSetupRequired,
 } from '../../../shared/dependency-health.js';
 import { canCmemGatewayServe } from '../../../shared/cmem-gateway.js';
+import { planPoolRotation } from '../../../shared/quota-pool-rotation.js';
 import {
+  clearQuotaCooldown,
   releaseQuotaProbe,
   recordAuthCooldown,
   recordQuotaExhausted,
@@ -349,6 +351,11 @@ export async function startGeneratorWithProvider(
           provider,
           kind: classified.kind,
         });
+      } else if (classified?.kind === 'quota_exhausted' && tryQuotaRotation(provider, session.sessionDbId)) {
+        // WINDOWS-FORK (P4): a quota refusal on one pool token cooled only that
+        // token. No breaker is armed and no failure is booked; the finally
+        // restarts the generator on the healthy token.
+        scheduledResume = { afterMs: 0, source: 'quota-rotate' };
       } else if (classified) {
         // The single error-level line for a classified provider failure:
         // code, message, action, link, and request id — same words the
@@ -421,7 +428,11 @@ export async function startGeneratorWithProvider(
       // A thrown classified error was already booked by the catch, once: it
       // is never re-booked here as a spent allowance (a rate limit is not
       // one), nor given a breaker over a cmem fallback's window.
-      if (normalizedReason === 'quota' && !failureBooked) {
+      if (normalizedReason === 'quota' && !failureBooked && tryQuotaRotation(provider, session.sessionDbId, reason?.split(':')[1])) {
+        // WINDOWS-FORK (P4): rotated to a healthy pool token, so no breaker and
+        // no failure booking; the resume below restarts the generator on it.
+        scheduledResume = { afterMs: 0, source: 'quota-rotate' };
+      } else if (normalizedReason === 'quota' && !failureBooked) {
         // Book what actually stopped the observer (quotaPauseForExit): the
         // SessionStart banner must not call a 95% reserve pause a spent
         // allowance, nor a provider's own refusal a precaution.
@@ -589,6 +600,36 @@ export async function startGeneratorWithProvider(
       }
     });
   session.generatorPromise = generatorPromise;
+}
+
+/**
+ * WINDOWS-FORK (P4): after a quota refusal cooled the active token, true when a
+ * healthy pool token exists and the caller must restart on it instead of arming
+ * the provider-wide breaker. Clears any stale breaker in that case. False means
+ * arm the breaker (pool exhausted, no pool, or the restart guard tripped).
+ */
+function tryQuotaRotation(provider: SelectableProvider, sessionDbId: number, window?: string): boolean {
+  if (provider !== 'claude') return false;
+  const plan = planPoolRotation();
+  if (!plan.rotate) {
+    if (plan.reason !== 'no_pool') {
+      logger.warn('SESSION', `Arming the provider quota breaker: ${plan.reason}`, {
+        sessionId: sessionDbId,
+        provider,
+        ...(window ? { window } : {}),
+        ...(plan.recentRestarts !== undefined ? { recentRestarts: plan.recentRestarts, restartLimit: plan.restartLimit } : {}),
+      });
+    }
+    return false;
+  }
+  clearQuotaCooldown(provider);
+  logger.warn('SESSION', `Quota hit on one pool token; rotating to token ${plan.rotatedToId} without arming the provider breaker`, {
+    sessionId: sessionDbId,
+    provider,
+    ...(window ? { window } : {}),
+    rotatedToId: plan.rotatedToId,
+  });
+  return true;
 }
 
 /**

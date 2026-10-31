@@ -10,6 +10,9 @@ import {
   getAuthMethodDescription,
   resolveConfigDirProfileKey,
 } from '../../shared/EnvManager.js';
+import { writeStaleMarker, markKeychainCooldown, getLastTokenSelection } from '../../shared/oauth-token.js';
+import { oauthTokenPool, type CooldownKind } from '../../shared/oauth-token-pool.js';
+import { coolActiveToken } from '../../shared/quota-pool-rotation.js';
 import { findClaudeExecutable } from '../../shared/find-claude-executable.js';
 import type { ActiveSession, PendingMessageWithId, SDKUserMessage } from '../worker-types.js';
 import { sameObservationContext } from './codex-observation-batch.js';
@@ -589,6 +592,15 @@ export class ClaudeProvider {
             // the runner books what the guard actually decided, whatever the
             // shared snapshot says by the time the generator exits.
             session.abortReason = `quota:${decision.window ?? 'unknown'}:${decision.pause?.kind ?? 'quota_exhausted'}`;
+            // WINDOWS-FORK (P4): cool only the token that hit the wall. When a
+            // healthy pool token remains, drop the old snapshots so the rotated
+            // session is not re-aborted by them; SessionRoutes restarts the generator.
+            const cooled = coolActiveToken('quota_exhausted');
+            logger.info('OAUTH', `Quota guard cooled active token: id=${cooled.cooledId ?? 'none'} rotatedTo=${cooled.rotatedToId ?? 'none'}`, {
+              sessionDbId: session.sessionDbId,
+              window: decision.window,
+            });
+            if (cooled.rotatedToId) globalRateLimitStore.clear();
             try {
               session.abortController.abort();
             } catch {
@@ -924,6 +936,62 @@ export class ClaudeProvider {
         await this.releaseClaimedBatchForTransportExit(session, 'transport:sdk_eof');
       }
     } catch (error) {
+      // WINDOWS-FORK (P4): pool-aware failure handler, next-call rotation. A
+      // rate_limit, quota or auth failure cools the token that was used so the
+      // next readClaudeOAuthToken call selects a healthy one. No in-flight retry.
+      {
+        const poolKind = classifyClaudeError(error).kind;
+        const rotatable = poolKind === 'rate_limit' || poolKind === 'quota_exhausted' || poolKind === 'auth_invalid';
+        const retryAfterMs: number | undefined = (() => {
+          const errAny = error as { headers?: Record<string, string>; retryAfter?: number; retry_after?: number };
+          if (typeof errAny?.retryAfter === 'number') return errAny.retryAfter * 1000;
+          if (typeof errAny?.retry_after === 'number') return errAny.retry_after * 1000;
+          const headerVal = errAny?.headers?.['retry-after'];
+          if (headerVal) {
+            const parsed = parseInt(headerVal, 10);
+            if (!isNaN(parsed)) return parsed * 1000;
+          }
+          return undefined;
+        })();
+        const tokenSelection = getLastTokenSelection();
+        if (rotatable && tokenSelection?.source === 'file-fallback' && oauthTokenPool.lastSelectedId) {
+          oauthTokenPool.markCooldown(oauthTokenPool.lastSelectedId, poolKind as CooldownKind, retryAfterMs);
+          const rotatedToId = oauthTokenPool.firstHealthyId();
+          logger.info('OAUTH', `Pool token marked cooling; pool exhausted=${oauthTokenPool.allExhausted()} cooledId=${oauthTokenPool.lastSelectedId} rotatedTo=${rotatedToId ?? 'none'}`, {
+            failedId: oauthTokenPool.lastSelectedId,
+            kind: poolKind,
+            sessionDbId: session.sessionDbId,
+          });
+          // The rate-limit store is global, not per token.
+          if (rotatedToId) globalRateLimitStore.clear();
+          if (oauthTokenPool.allExhausted()) {
+            writeStaleMarker(
+              'All claude-mem subscription tokens are capped or expired. ' +
+              'Run `claude setup-token` for each subscription and add the values ' +
+              'to ~/.claude-mem/.oauth_tokens, then restart the worker.'
+            );
+          }
+        } else if (
+          rotatable &&
+          (tokenSelection?.source === 'keychain' || tokenSelection?.source === 'env-fallback')
+        ) {
+          markKeychainCooldown(poolKind as CooldownKind, retryAfterMs);
+          const rotatedToId = oauthTokenPool.firstHealthyId();
+          logger.info('OAUTH', `Keychain/env token cooled after ${poolKind}; next call will try pool rotatedTo=${rotatedToId ?? 'none'}`, {
+            source: tokenSelection.source,
+            kind: poolKind,
+            sessionDbId: session.sessionDbId,
+          });
+          if (rotatedToId) globalRateLimitStore.clear();
+        } else if (poolKind === 'auth_invalid') {
+          writeStaleMarker(
+            'claude-mem summarization auth failed at runtime (HTTP 401/403). The ' +
+            'OAuth token is invalid or expired. Refresh it: run `claude setup-token` ' +
+            'and add the value to ~/.claude-mem/.oauth_tokens (pool file), ' +
+            'or re-login via Claude Desktop if you use the keychain.'
+          );
+        }
+      }
       // A missing binary (ENOENT) or a Windows .cmd/.bat shim that cannot be
       // launched without a shell (EINVAL) surfaces here as a raw spawn error.
       // Left unclassified it is a generic failure, retried on every later

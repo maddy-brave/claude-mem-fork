@@ -55,6 +55,7 @@ import { teamBrainConnection } from '../shared/teambrain.js';
 import { isWorkStateEnabled } from '../shared/work-state-setting.js';
 import { getProjectContext, type ProjectContext } from '../utils/project-name.js';
 import { withCheckoutProjects } from './checkout-search-scope.js';
+import { parseObservationIds } from '../shared/observation-ids.js';
 import { postCorpusRequestOverSse } from './corpus-worker-stream.js';
 import { withWorkerRestartOnRefusedConnection } from './worker-restart.js';
 import { ProgressiveSearchError, progressiveSearchToolError } from '../shared/progressive-search.js';
@@ -515,6 +516,31 @@ interface McpToolDefinition {
   handler: (args: any) => any;
 }
 
+/**
+ * get_observations input schema. The worker reads numeric IDs, so the worker
+ * runtime states integer items; the server runtime reads string IDs and keeps
+ * both. The top level stays a plain object, with no anyOf, oneOf or allOf,
+ * because Claude Code skips a tool whose schema has one.
+ */
+function getObservationsInputSchema(runtime: SelectedRuntime) {
+  const server = runtime === 'server';
+  return {
+    type: 'object',
+    properties: {
+      ids: {
+        type: 'array',
+        items: server ? { type: ['number', 'string'] } : { type: 'integer' },
+        description: server
+          ? 'Array of selected observation IDs to fetch (string IDs in server runtime)'
+          : 'Array of integer observation IDs from search or timeline results, for example [123, 456]. Numeric strings such as "123" are coerced; non-numeric values are rejected.'
+      },
+      projectId: { type: 'string', description: 'Server project ID; defaults to the configured server project' }
+    },
+    required: ['ids'],
+    additionalProperties: true
+  };
+}
+
 const tools: McpToolDefinition[] = [
   {
     name: 'dumb_search',
@@ -690,19 +716,7 @@ Optional Dumb search: \`dumb_search({query, project})\`. Doesn’t reason about 
   {
     name: 'get_observations',
     description: 'Step 3: Fetch selected useful details for the IDs chosen after reviewing the index and timeline. Any shortening is marked. Params: ids (required), orderBy, limit, project (worker) or projectId (server)',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        ids: {
-          type: 'array',
-          items: { type: ['number', 'string'] },
-          description: 'Array of selected observation IDs to fetch (string IDs in server runtime)'
-        },
-        projectId: { type: 'string', description: 'Server project ID; defaults to the configured server project' }
-      },
-      required: ['ids'],
-      additionalProperties: true
-    },
+    get inputSchema() { return getObservationsInputSchema(selectRuntime()); },
     annotations: READ_ONLY_TOOL_ANNOTATIONS,
     handler: async (args: any) => {
       if (selectRuntime() === 'server') {
@@ -711,7 +725,11 @@ Optional Dumb search: \`dumb_search({query, project})\`. Doesn’t reason about 
         if (args?.project !== undefined || args?.orderBy !== undefined || args?.limit !== undefined) return mcpTextResult('Server get_observations uses ids and optional projectId; local filters are unsupported.', true);
         return formatMcpPayload('observations', await ctx.client.selectedObservations({ projectId: args.projectId || ctx.projectId, ids: args.ids.map(String) }));
       }
-      return await callWorker('/api/observations/batch', { body: withCheckoutProjects(args ?? {}, currentCheckout()) });
+      // Callers pass IDs as strings such as "123". Coerce here so the worker route
+      // sees integers, and reject a non-numeric ID before the request is made.
+      const parsedIds = parseObservationIds(args?.ids);
+      if (!parsedIds.ok) return mcpTextResult(parsedIds.message, true);
+      return await callWorker('/api/observations/batch', { body: withCheckoutProjects({ ...(args ?? {}), ids: parsedIds.ids }, currentCheckout()) });
     }
   },
   {

@@ -1,6 +1,7 @@
 
 import { logger } from '../utils/logger.js';
 import { ModeManager } from '../services/domain/ModeManager.js';
+import { inferTypeFromContent, resolveEmittedType } from './observation-type.js';
 
 // TODO(#2233): migrate to Anthropic tool-use API for deterministic JSON output. This text-XML path is the bridge.
 // Only strip fences when the entire payload is a single fenced block. Stripping
@@ -173,10 +174,27 @@ function parseObservationBlocks(
     if (type) {
       finalType = type;
       if (!validTypes.includes(type)) {
-        logger.error('PARSER', `Invalid observation type: ${type}, preserving emitted type`, { correlationId });
+        // F10b: map an undeclared label (a concept keyword such as `gotcha`, or an
+        // ad-hoc one such as `finding`) onto a declared type when it clearly means
+        // one. Genuinely unknown labels are still preserved as emitted.
+        const resolved = resolveEmittedType(type, validTypes);
+        if (resolved) {
+          finalType = resolved;
+          logger.warn('PARSER', `Observation type "${type}" is not declared, mapped to "${resolved}"`, { correlationId });
+        } else {
+          logger.error('PARSER', `Invalid observation type: ${type}, preserving emitted type`, { correlationId });
+        }
       }
     } else {
-      logger.error('PARSER', `Observation missing type field, defaulting to the first declared type: "${fallbackType}"`, { correlationId });
+      // F10: infer the type from concepts and title before falling back to the
+      // first declared type, which would file an untyped observation as a bug fix.
+      const inferred = inferTypeFromContent({ concepts, title }, validTypes);
+      if (inferred) {
+        finalType = inferred;
+        logger.warn('PARSER', `Observation missing type field, inferred "${inferred}" from its content`, { correlationId });
+      } else {
+        logger.error('PARSER', `Observation missing type field, defaulting to the first declared type: "${fallbackType}"`, { correlationId });
+      }
     }
 
     // #3379: concepts are matched exactly by the injection SQL, so a prefixed
@@ -313,19 +331,34 @@ function extractField(content: string, fieldName: string): string | null {
   return trimmed.trim() === '' ? null : trimmed;
 }
 
+const MAX_UNCLOSED_TYPE_CHARS = 64;
+
 /**
  * The type is a single id, so no markup belongs in it. Models sometimes close
  * it with a stray tag and re-open it (`<type>bugfix</parameter> <type>discovery</type>`),
  * or restart the whole observation mid-type. The last `<type>` opened before
  * the first `</type>` is the value the model settled on; any tag left inside
  * it is dropped.
+ *
+ * F10: the observer also closes the type with a stray tag and never writes
+ * `</type>` (`<type>discovery</parameter>`, `<type>bugfix</reasoning_effort>`),
+ * which left no match and filed the observation under the first declared type.
+ * When no `</type>` closes the element, the value is the text after the last
+ * `<type>` up to the next tag or line break, unless it runs past
+ * MAX_UNCLOSED_TYPE_CHARS, which marks prose rather than an id.
  */
 function extractTypeField(content: string): string | null {
   const match = /<type>((?:(?!<type>)[\s\S])*?)<\/type>/i.exec(content);
-  if (!match) return null;
+  if (match) {
+    const value = decodeXmlReferences(match[1].replace(/<\/?[A-Za-z_][\w-]*\b[^>]*>/g, '')).trim();
+    return value === '' ? null : value;
+  }
 
-  const value = decodeXmlReferences(match[1].replace(/<\/?[A-Za-z_][\w-]*\b[^>]*>/g, '')).trim();
-  return value === '' ? null : value;
+  const unclosed = [...content.matchAll(/<type>([^<\r\n]+)/gi)].pop();
+  if (!unclosed) return null;
+
+  const value = decodeXmlReferences(unclosed[1]).trim();
+  return value === '' || value.length > MAX_UNCLOSED_TYPE_CHARS ? null : value;
 }
 
 function extractArrayElements(content: string, arrayName: string, elementName: string): string[] {

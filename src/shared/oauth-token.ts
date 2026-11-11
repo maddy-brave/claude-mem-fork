@@ -633,6 +633,8 @@ async function readStoredClaudeCredential(
 /**
  * Read the Claude Code OAuth token the SDK child should run with.
  *
+ *   0. FORK P4, opt-in: with CLAUDE_MEM_OAUTH_PREFER_POOL=1 a healthy token
+ *      from the pool wins before anything below is read.
  *   1. The login Claude Code keeps for this profile (readStoredClaudeCredential).
  *      A present result wins.
  *   2. CLAUDE_CODE_OAUTH_TOKEN, for CI/headless setups. A usable env token
@@ -657,6 +659,18 @@ export async function readClaudeOAuthToken(
   // platform; only the macOS keychain also derives a service name from it.
   const settings = SettingsDefaultsManager.loadFromFile(paths.settings());
   const credentialProfile = resolveClaudeCredentialProfile(settings.CLAUDE_MEM_CLAUDE_CONFIG_DIR);
+
+  // FORK P4: operator opt-in. A healthy pool token outranks the stored login, so the
+  // worker never shares a rotating keychain token with an interactive session. A
+  // fully cooling or empty pool falls through to the order below, unchanged. Unset,
+  // this block never runs and the stored login is not skipped.
+  if (process.env.CLAUDE_MEM_OAUTH_PREFER_POOL === '1' && oauthTokenPool.hasHealthyToken()) {
+    const preferred = oauthTokenPool.selectToken();
+    if (preferred) {
+      lastSelection = { source: 'file-fallback', poolId: preferred.id };
+      return { kind: 'present', token: preferred.token, source: 'file-fallback', poolId: preferred.id };
+    }
+  }
 
   const storedResult = await readStoredClaudeCredential(credentialProfile, execImpl);
   // FORK P4: a present stored token wins unless it is cooling after a quota refusal.

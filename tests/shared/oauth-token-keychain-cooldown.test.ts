@@ -6,7 +6,7 @@
  * clearKeychainCooldown, getLastTokenSelection, and the keychain short-circuit
  * guard (B2 steps 4-5).
  */
-import { describe, it, expect, beforeEach, afterEach, spyOn } from 'bun:test';
+import { describe, it, expect, beforeEach, afterEach, spyOn, mock } from 'bun:test';
 import * as fs from 'fs';
 import * as os from 'os';
 import { join } from 'path';
@@ -25,6 +25,7 @@ const ORIGINAL_PLATFORM = process.platform;
 const ORIGINAL_ENV_TOKEN = process.env.CLAUDE_CODE_OAUTH_TOKEN;
 const ORIGINAL_POOL_FILE = process.env.CLAUDE_MEM_OAUTH_TOKENS_FILE;
 const ORIGINAL_DATA_DIR = process.env.CLAUDE_MEM_DATA_DIR;
+const ORIGINAL_PREFER_POOL = process.env.CLAUDE_MEM_OAUTH_PREFER_POOL;
 
 function setPlatform(value: NodeJS.Platform): void {
   Object.defineProperty(process, 'platform', { value, configurable: true });
@@ -74,6 +75,9 @@ afterEach(() => {
 
   if (ORIGINAL_DATA_DIR === undefined) delete process.env.CLAUDE_MEM_DATA_DIR;
   else process.env.CLAUDE_MEM_DATA_DIR = ORIGINAL_DATA_DIR;
+
+  if (ORIGINAL_PREFER_POOL === undefined) delete process.env.CLAUDE_MEM_OAUTH_PREFER_POOL;
+  else process.env.CLAUDE_MEM_OAUTH_PREFER_POOL = ORIGINAL_PREFER_POOL;
 
   try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch { /* best effort */ }
 });
@@ -214,5 +218,118 @@ describe('readClaudeOAuthToken — darwin + cooling (B2 step 5 core path)', () =
     expect(['present', 'expired', 'absent']).toContain(result!.kind);
 
     clearKeychainCooldown();
+  });
+});
+
+describe('readClaudeOAuthToken, CLAUDE_MEM_OAUTH_PREFER_POOL (fork P4 opt-in)', () => {
+  // A present keychain login is faked through the execImpl seam on a spoofed
+  // darwin platform, so these never shell out to the real `security` binary.
+  // Token strings are fake and never leave the test.
+  const KEYCHAIN_TOKEN = 'sk-ant-oat01-fake-keychain-login';
+
+  function fakeKeychainExec(): any {
+    const payload = JSON.stringify({
+      claudeAiOauth: { accessToken: KEYCHAIN_TOKEN, expiresAt: Date.now() + 60 * 60 * 1000 },
+    });
+    return mock(() => Promise.resolve({ stdout: payload, stderr: '' }));
+  }
+
+  function armPool(tokens: string[]): void {
+    process.env.CLAUDE_MEM_OAUTH_TOKENS_FILE = writePoolFile(tokens);
+    delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+    oauthTokenPool.resetForTests();
+  }
+
+  it('flag set, keychain present, pool healthy: returns the pool token as file-fallback', async () => {
+    setPlatform('darwin');
+    armPool(['pool-token-prefer-a', 'pool-token-prefer-b']);
+    process.env.CLAUDE_MEM_OAUTH_PREFER_POOL = '1';
+    const exec = fakeKeychainExec();
+
+    const result = await readClaudeOAuthToken(exec);
+
+    expect(result.kind).toBe('present');
+    if (result.kind === 'present') {
+      expect(result.source).toBe('file-fallback');
+      expect(result.token).toBe('pool-token-prefer-a');
+      expect(result.poolId).toBeDefined();
+    }
+    expect(getLastTokenSelection()?.source).toBe('file-fallback');
+    // The stored login is not even read while the pool is healthy.
+    expect(exec).not.toHaveBeenCalled();
+  });
+
+  it('flag set, first pool token cooling: returns the next healthy pool token', async () => {
+    setPlatform('darwin');
+    armPool(['pool-token-prefer-a', 'pool-token-prefer-b']);
+    process.env.CLAUDE_MEM_OAUTH_PREFER_POOL = '1';
+    const [first] = oauthTokenPool.loadPool();
+    oauthTokenPool.markCooldown(first.id, 'auth_invalid');
+
+    const result = await readClaudeOAuthToken(fakeKeychainExec());
+
+    expect(result.kind).toBe('present');
+    if (result.kind === 'present') {
+      expect(result.source).toBe('file-fallback');
+      expect(result.token).toBe('pool-token-prefer-b');
+    }
+  });
+
+  it('flag set, every pool token cooling: falls through to the keychain', async () => {
+    setPlatform('darwin');
+    armPool(['pool-token-prefer-a', 'pool-token-prefer-b']);
+    process.env.CLAUDE_MEM_OAUTH_PREFER_POOL = '1';
+    for (const entry of oauthTokenPool.loadPool()) {
+      oauthTokenPool.markCooldown(entry.id, 'quota_exhausted');
+    }
+    const exec = fakeKeychainExec();
+
+    const result = await readClaudeOAuthToken(exec);
+
+    expect(result.kind).toBe('present');
+    if (result.kind === 'present') {
+      expect(result.source).toBe('keychain');
+      expect(result.token).toBe(KEYCHAIN_TOKEN);
+    }
+    expect(getLastTokenSelection()?.source).toBe('keychain');
+    expect(exec).toHaveBeenCalledTimes(1);
+  });
+
+  it('flag set, pool empty: falls through to the keychain', async () => {
+    setPlatform('darwin');
+    process.env.CLAUDE_MEM_OAUTH_TOKENS_FILE = join(tempDir, 'does-not-exist');
+    delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+    oauthTokenPool.resetForTests();
+    process.env.CLAUDE_MEM_OAUTH_PREFER_POOL = '1';
+
+    const result = await readClaudeOAuthToken(fakeKeychainExec());
+
+    expect(result.kind).toBe('present');
+    if (result.kind === 'present') expect(result.source).toBe('keychain');
+  });
+
+  it('flag unset, keychain present, pool healthy: keychain still wins', async () => {
+    setPlatform('darwin');
+    armPool(['pool-token-prefer-a']);
+    delete process.env.CLAUDE_MEM_OAUTH_PREFER_POOL;
+
+    const result = await readClaudeOAuthToken(fakeKeychainExec());
+
+    expect(result.kind).toBe('present');
+    if (result.kind === 'present') {
+      expect(result.source).toBe('keychain');
+      expect(result.token).toBe(KEYCHAIN_TOKEN);
+    }
+  });
+
+  it('flag set to a value other than 1: keychain still wins', async () => {
+    setPlatform('darwin');
+    armPool(['pool-token-prefer-a']);
+    process.env.CLAUDE_MEM_OAUTH_PREFER_POOL = 'true';
+
+    const result = await readClaudeOAuthToken(fakeKeychainExec());
+
+    expect(result.kind).toBe('present');
+    if (result.kind === 'present') expect(result.source).toBe('keychain');
   });
 });

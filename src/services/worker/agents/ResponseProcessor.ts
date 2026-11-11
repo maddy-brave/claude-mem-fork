@@ -21,6 +21,9 @@ import { updateFolderClaudeMdFiles } from '../../../utils/claude-md-utils.js';
 import { getWorkerPort } from '../../../shared/worker-utils.js';
 import { recordObserverFailure, recordObserverSuccess } from '../../../shared/observer-health.js';
 import { clearQuotaCooldown, routeAroundUnservableProviderIfLoaded } from '../../../shared/quota-cooldown.js';
+import { getLastTokenSelection } from '../../../shared/oauth-token.js';
+import { KEYCHAIN_AUTH_REFUSED_COOLDOWN_MS, oauthTokenPool } from '../../../shared/oauth-token-pool.js';
+import { coolActiveToken } from '../../../shared/quota-pool-rotation.js';
 import { recycleObserverConversation } from '../session/recycle-conversation.js';
 import { clearRejectedOutput, recordRejectedOutput } from '../session/OutputRecovery.js';
 import { SettingsDefaultsManager } from '../../../shared/SettingsDefaultsManager.js';
@@ -518,6 +521,35 @@ export function hasUnfinishedObservationBlock(text: string): boolean {
   return /<observation>/i.test(outsideWholeBlocks);
 }
 
+/**
+ * FORK P4: an in-band auth refusal ("Failed to authenticate: OAuth token
+ * revoked") is assistant text, so it never throws and ClaudeProvider's catch
+ * never cools the credential. Cool the one just refused here, so the next
+ * readClaudeOAuthToken call selects a healthy pool token instead of re-reading
+ * the same login. Returns the id of that pool token when the credential was
+ * cooled and one exists, else undefined.
+ *
+ * Only a primary run that billed the Claude Code login reached the pool-aware
+ * token read, so an API-key run or a stand-in run is left alone. A pool token
+ * is cooled with the 6 h auth_invalid default. A keychain or env token is a
+ * login the interactive client may only have rotated, so it gets the short
+ * KEYCHAIN_AUTH_REFUSED_COOLDOWN_MS, and only when a healthy pool token exists
+ * to take over: cooling it with none would push the next read onto a cooling
+ * pool token ahead of a login that is still good.
+ */
+function coolRefusedCredential(session: ActiveSession, providerName: string): string | undefined {
+  if (providerName !== 'claude' || session.observerAuth !== 'subscription') return undefined;
+  if (session.fallbackFrom != null || session.claudeAuthOverride != null) return undefined;
+  const source = getLastTokenSelection()?.source;
+  if (source === 'file-fallback') {
+    return coolActiveToken('auth_invalid').rotatedToId;
+  }
+  if ((source === 'keychain' || source === 'env-fallback') && oauthTokenPool.hasHealthyToken()) {
+    return coolActiveToken('auth_invalid', KEYCHAIN_AUTH_REFUSED_COOLDOWN_MS).rotatedToId;
+  }
+  return undefined;
+}
+
 export async function processAgentResponse(
   text: string,
   session: ActiveSession,
@@ -603,6 +635,9 @@ export async function processAgentResponse(
       // observer, but /login cannot fix it (#4677): keep it apart so the
       // runner books the API-key / admin remedy instead.
       const orgDisabledSubscription = isOrgDisabledSubscriptionObserverOutput(text);
+      // FORK P4: cool the credential that was just refused so the next start rotates.
+      // The org-disabled refusal is not a credential fault, so nothing is cooled.
+      const rotatedToId = orgDisabledSubscription ? undefined : coolRefusedCredential(session, providerName);
       await sessionManager.resetProcessingToPending(session.sessionDbId);
       session.abortReason = orgDisabledSubscription ? 'auth:observer_org_policy' : 'auth:observer_text';
       try {
@@ -616,10 +651,12 @@ export async function processAgentResponse(
       worker?.recordAiInteraction?.({ success: false, error: 'unauthenticated', provider: providerName });
       logger.error('PARSER', orgDisabledSubscription
         ? `${agentName} refused: the organization has disabled Claude subscription access; queued batch preserved`
-        : `${agentName} authentication failed; run /login to preserve queued batch`, {
+        : rotatedToId
+          ? `${agentName} credential refused; cooled it, next start uses pool token ${rotatedToId}; queued batch preserved`
+          : `${agentName} authentication failed; run /login to preserve queued batch`, {
         sessionId: session.sessionDbId,
         outputClass: 'prose',
-        remediation: orgDisabledSubscription ? 'api_key_or_admin' : '/login',
+        remediation: orgDisabledSubscription ? 'api_key_or_admin' : rotatedToId ? 'pool_rotation' : '/login',
         preview: previewOutput(text),
       });
       return null;

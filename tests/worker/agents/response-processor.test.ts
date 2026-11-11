@@ -1,5 +1,5 @@
 import { describe, it, expect, mock, beforeEach, afterEach, afterAll, spyOn } from 'bun:test';
-import { existsSync, readFileSync, mkdtempSync, rmSync } from 'fs';
+import { existsSync, readFileSync, mkdtempSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { paths } from '../../../src/shared/paths.js';
@@ -7,6 +7,8 @@ import { SessionStore } from '../../../src/services/sqlite/SessionStore.js';
 import { recordObserverFailure, readObserverHealth } from '../../../src/shared/observer-health.js';
 import { recordQuotaExhausted, getQuotaCooldown, resetQuotaCooldownsForTesting } from '../../../src/shared/quota-cooldown.js';
 import { logger } from '../../../src/utils/logger.js';
+import { clearKeychainCooldown, readClaudeOAuthToken } from '../../../src/shared/oauth-token.js';
+import { oauthTokenPool } from '../../../src/shared/oauth-token-pool.js';
 
 // Capture real exports before mock.module mutates the live namespace, then
 // re-register the snapshots in afterAll so these partial stubs do not leak
@@ -1761,6 +1763,182 @@ describe('ResponseProcessor', () => {
       expect(session.abortReason).toBe('auth:observer_org_policy');
     });
   });
+  describe('in-band auth refusal cools the refused credential (fork P4)', () => {
+    // The refusal arrives as assistant text, so ClaudeProvider's catch never
+    // sees it. ResponseProcessor cools the credential the run was spawned
+    // with, and GeneratorRunner then restarts on a healthy pool token.
+    // Tokens here are fake strings; none reaches a log or a process.
+    const REFUSAL = 'Failed to authenticate: OAuth token revoked. Please log in again or contact your administrator.';
+    const ORG_DISABLED = 'Your organization has disabled Claude subscription access for Claude Code · Use an Anthropic API key instead, or ask your admin to enable access';
+    const KEYCHAIN_TOKEN = 'sk-ant-oat01-fake-keychain-login';
+    const realPlatform = process.platform;
+    const saved = {
+      poolFile: process.env.CLAUDE_MEM_OAUTH_TOKENS_FILE,
+      envToken: process.env.CLAUDE_CODE_OAUTH_TOKEN,
+      prefer: process.env.CLAUDE_MEM_OAUTH_PREFER_POOL,
+    };
+    let keychainExec: ReturnType<typeof mock>;
+    let resetProcessingToPending: ReturnType<typeof mock>;
+
+    function setPlatform(value: NodeJS.Platform): void {
+      Object.defineProperty(process, 'platform', { value, configurable: true });
+    }
+
+    function restoreEnv(key: keyof typeof saved, name: string): void {
+      if (saved[key] === undefined) delete process.env[name];
+      else process.env[name] = saved[key];
+    }
+
+    beforeEach(() => {
+      // An empty credential dir keeps the developer's real login out of the read.
+      extraMockSettings = { CLAUDE_MEM_CLAUDE_CONFIG_DIR: join(ownedHealthDirectory, 'claude-config') };
+      delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+      delete process.env.CLAUDE_MEM_OAUTH_PREFER_POOL;
+      process.env.CLAUDE_MEM_OAUTH_TOKENS_FILE = join(ownedHealthDirectory, 'no-pool-file');
+      clearKeychainCooldown();
+      oauthTokenPool.resetForTests();
+      keychainExec = mock(() => Promise.resolve({
+        stdout: JSON.stringify({ claudeAiOauth: { accessToken: KEYCHAIN_TOKEN, expiresAt: Date.now() + 60 * 60 * 1000 } }),
+        stderr: '',
+      }));
+      resetProcessingToPending = mock(async () => 1);
+      mockSessionManager = {
+        getMessageIterator: async function* () { yield* []; },
+        getPendingMessageStore: () => ({ markProcessed: mock(() => {}) }),
+        confirmClaimedMessages: mock(async () => 0),
+        resetProcessingToPending,
+      } as unknown as SessionManager;
+    });
+
+    afterEach(() => {
+      Object.defineProperty(process, 'platform', { value: realPlatform, configurable: true });
+      restoreEnv('poolFile', 'CLAUDE_MEM_OAUTH_TOKENS_FILE');
+      restoreEnv('envToken', 'CLAUDE_CODE_OAUTH_TOKEN');
+      restoreEnv('prefer', 'CLAUDE_MEM_OAUTH_PREFER_POOL');
+      clearKeychainCooldown();
+      oauthTokenPool.resetForTests();
+    });
+
+    function armPool(tokens: string[]): void {
+      const file = join(ownedHealthDirectory, '.oauth_tokens');
+      writeFileSync(file, tokens.join('\n') + '\n', 'utf-8');
+      process.env.CLAUDE_MEM_OAUTH_TOKENS_FILE = file;
+      oauthTokenPool.resetForTests();
+    }
+
+    /** The run was spawned on the pool: an unsupported platform has no stored login. */
+    async function spawnOnPool(): Promise<void> {
+      setPlatform('aix' as NodeJS.Platform);
+      const result = await readClaudeOAuthToken();
+      expect(result.kind === 'present' && result.source).toBe('file-fallback');
+    }
+
+    /** The run was spawned on the keychain login. */
+    async function spawnOnKeychain(): Promise<void> {
+      setPlatform('darwin');
+      const result = await readClaudeOAuthToken(keychainExec as never);
+      expect(result.kind === 'present' && result.source).toBe('keychain');
+    }
+
+    async function nextSpawnSource(): Promise<string | undefined> {
+      const result = process.platform === 'darwin'
+        ? await readClaudeOAuthToken(keychainExec as never)
+        : await readClaudeOAuthToken();
+      return result.kind === 'present' ? result.source : undefined;
+    }
+
+    async function refuse(text: string, overrides: Partial<ActiveSession> = {}): Promise<ActiveSession> {
+      const session = createMockSession({ observerAuth: 'subscription', ...overrides });
+      await processAgentResponse(text, session, mockDbManager, mockSessionManager, mockWorker, 100, null, 'TestAgent');
+      return session;
+    }
+
+    it('cools a refused pool token for the 6 h default and leaves the others healthy', async () => {
+      armPool(['pool-token-refused', 'pool-token-spare']);
+      await spawnOnPool();
+      const before = Date.now();
+
+      const session = await refuse(REFUSAL);
+
+      const [refused, spare] = oauthTokenPool.statusSnapshot();
+      expect(refused.cooldownUntil).toBeGreaterThanOrEqual(before + 6 * 60 * 60_000);
+      expect(spare.cooldownUntil).toBeUndefined();
+      expect(oauthTokenPool.firstHealthyId()).toBe(spare.id);
+      expect(session.abortReason).toBe('auth:observer_text');
+      expect(resetProcessingToPending).toHaveBeenCalledWith(1);
+      // The log names the rotation target, never /login, and never a token value.
+      const errorCalls = (logger.error as unknown as ReturnType<typeof mock>).mock.calls;
+      const message = String(errorCalls[errorCalls.length - 1][1]);
+      expect(message).toContain(`pool token ${spare.id}`);
+      expect(message).not.toContain('/login');
+      expect(JSON.stringify(errorCalls)).not.toContain('pool-token-');
+    });
+
+    it('cools a refused keychain login for 15 min when a healthy pool token can take over', async () => {
+      armPool(['pool-token-spare']);
+      await spawnOnKeychain();
+      const realNow = Date.now();
+
+      await refuse(REFUSAL);
+
+      expect(await nextSpawnSource()).toBe('file-fallback');
+      const nowSpy = spyOn(Date, 'now').mockImplementation(() => realNow + 14 * 60_000);
+      expect(await nextSpawnSource()).toBe('file-fallback');
+      nowSpy.mockImplementation(() => realNow + 16 * 60_000);
+      expect(await nextSpawnSource()).toBe('keychain');
+      nowSpy.mockRestore();
+    });
+
+    it('keeps the keychain login, and the old pause, when the pool is empty', async () => {
+      await spawnOnKeychain();
+
+      const session = await refuse(REFUSAL);
+
+      expect(session.abortReason).toBe('auth:observer_text');
+      expect(resetProcessingToPending).toHaveBeenCalledWith(1);
+      expect(await nextSpawnSource()).toBe('keychain');
+      const errorCalls = (logger.error as unknown as ReturnType<typeof mock>).mock.calls;
+      expect(String(errorCalls[errorCalls.length - 1][1])).toContain('run /login to preserve queued batch');
+    });
+
+    it('keeps the keychain login when every pool token is already cooling', async () => {
+      armPool(['pool-token-a', 'pool-token-b']);
+      await spawnOnKeychain();
+      for (const entry of oauthTokenPool.statusSnapshot()) oauthTokenPool.markCooldown(entry.id, 'quota_exhausted');
+
+      const session = await refuse(REFUSAL);
+
+      expect(session.abortReason).toBe('auth:observer_text');
+      expect(await nextSpawnSource()).toBe('keychain');
+    });
+
+    it('does not cool anything on the org-disabled refusal', async () => {
+      armPool(['pool-token-a', 'pool-token-b']);
+      await spawnOnKeychain();
+      const onKeychain = await refuse(ORG_DISABLED);
+      expect(onKeychain.abortReason).toBe('auth:observer_org_policy');
+      expect(await nextSpawnSource()).toBe('keychain');
+
+      await spawnOnPool();
+      const onPool = await refuse(ORG_DISABLED);
+      expect(onPool.abortReason).toBe('auth:observer_org_policy');
+      expect(oauthTokenPool.statusSnapshot().every(entry => entry.cooldownUntil === undefined)).toBe(true);
+    });
+
+    it('leaves a run that did not bill the Claude Code login alone', async () => {
+      armPool(['pool-token-a', 'pool-token-b']);
+      await spawnOnKeychain();
+
+      const apiKeyRun = await refuse(REFUSAL, { observerAuth: 'api-key' });
+      const standInRun = await refuse(REFUSAL, { claudeAuthOverride: 'subscription' });
+
+      expect(apiKeyRun.abortReason).toBe('auth:observer_text');
+      expect(standInRun.abortReason).toBe('auth:observer_text');
+      expect(await nextSpawnSource()).toBe('keychain');
+      expect(oauthTokenPool.statusSnapshot().every(entry => entry.cooldownUntil === undefined)).toBe(true);
+    });
+  });
+
   describe('lastSummaryStored tracking (#1633)', () => {
     it('should set lastSummaryStored=true when storage returns a summaryId', async () => {
       mockStoreObservations.mockImplementation(() => ({

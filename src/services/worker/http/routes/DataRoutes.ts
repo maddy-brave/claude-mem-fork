@@ -26,6 +26,7 @@ import { assertCanonicalDecimal, type ContentKind } from '../../../sync/Canonica
 import type { CloudSync } from '../../../sync/CloudSync.js';
 import { emitContextInvalidation } from '../../../../shared/context-invalidation.js';
 import { projectReadKeysFor } from '../../search/project-where-filter.js';
+import { coerceObservationIds, invalidObservationIdMessage } from '../../../../shared/observation-ids.js';
 
 // Chroma doc_type per content kind. Observation and summary id spaces overlap,
 // so the delete-route cleanup must be scoped by doc_type, not sqlite_id alone.
@@ -37,19 +38,12 @@ const CHROMA_DOC_TYPES: Record<IndexedRowKind, string> = {
 };
 import { withObservationMedia } from '../../../media/feed.js';
 
-const integerArrayLike = z.preprocess((value) => {
-  if (Array.isArray(value)) return value;
-  if (typeof value === 'string') {
-    try {
-      const parsed = JSON.parse(value);
-      if (Array.isArray(parsed)) return parsed;
-    } catch {
-      // not JSON, fall through to comma split
-    }
-    return value.split(',').map((part) => Number(part.trim()));
-  }
-  return value;
-}, z.array(z.number().int()));
+// Numeric strings such as ["123"] are coerced to integers before validation. MCP
+// callers pass IDs as text; a non-numeric element is rejected with its value named.
+const observationId = z.number({ error: (issue) => invalidObservationIdMessage(issue.input) })
+  .int({ error: (issue) => invalidObservationIdMessage(issue.input) })
+  .safe({ error: (issue) => invalidObservationIdMessage(issue.input) });
+const integerArrayLike = z.preprocess(coerceObservationIds, z.array(observationId));
 
 const stringArrayLike = z.preprocess((value) => {
   if (Array.isArray(value)) return value;

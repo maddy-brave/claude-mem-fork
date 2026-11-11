@@ -147,6 +147,42 @@ describe('DataRoutes Type Coercion', () => {
       expect(statusSpy).toHaveBeenCalledWith(400);
     });
 
+    it('should coerce numeric strings inside a native array: ["123"] becomes [123]', () => {
+      const { req, res, jsonSpy } = createMockReqRes({ ids: ['123'] });
+      handler(req as Request, res as Response);
+
+      expect(mockGetObservationsByIds).toHaveBeenCalledWith([123], expect.anything());
+      expect(jsonSpy).toHaveBeenCalled();
+    });
+
+    it('should accept a native number array [123] unchanged', () => {
+      const { req, res, jsonSpy } = createMockReqRes({ ids: [123] });
+      handler(req as Request, res as Response);
+
+      expect(mockGetObservationsByIds).toHaveBeenCalledWith([123], expect.anything());
+      expect(jsonSpy).toHaveBeenCalled();
+    });
+
+    it('should reject ["abc"] with a 400 that names the value', () => {
+      const { req, res, jsonSpy, statusSpy } = createMockReqRes({ ids: ['abc'] });
+      handler(req as Request, res as Response);
+
+      expect(statusSpy).toHaveBeenCalledWith(400);
+      expect(mockGetObservationsByIds).not.toHaveBeenCalled();
+      const payload = (jsonSpy.mock.calls[0] as any[])[0];
+      expect(payload.error).toBe('ValidationError');
+      expect(payload.issues[0].message).toContain('ids must be integers');
+      expect(payload.issues[0].message).toContain('"abc"');
+    });
+
+    it('should reject a mixed array when one element is not numeric', () => {
+      const { req, res, statusSpy } = createMockReqRes({ ids: ['1', 'abc'] });
+      handler(req as Request, res as Response);
+
+      expect(statusSpy).toHaveBeenCalledWith(400);
+      expect(mockGetObservationsByIds).not.toHaveBeenCalled();
+    });
+
     it('should reject missing ids', () => {
       const { req, res, statusSpy } = createMockReqRes({});
       handler(req as Request, res as Response);

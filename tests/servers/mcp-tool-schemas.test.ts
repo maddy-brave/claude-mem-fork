@@ -21,6 +21,7 @@ async function withServer(
   app.use(express.json());
   app.use((req, _res, next) => { workerRequests.push({ path: req.path, body: req.body, query: req.query }); next(); });
   app.get('/api/health', (_req, res) => res.json({ status: 'ok' }));
+  app.post('/api/observations/batch', (_req, res) => res.json([{ id: 123, title: 'stub observation' }]));
   app.post('/api/work-state/entries', (_req, res) => res.json({ entries: [] }));
   app.get('/api/work-state', (_req, res) => res.json({ entries: [] }));
   const server = app.listen(0, '127.0.0.1');
@@ -99,6 +100,62 @@ describe('MCP tool inputSchema declarations', () => {
     expect(tools.has('observation_context')).toBe(true);
     expect(required('observation_context')).toEqual([]);
   });
+});
+
+describe('get_observations ids', () => {
+  type ObservationsSchema = { anyOf?: unknown; oneOf?: unknown; allOf?: unknown; properties: { ids: { items: { type: unknown } } } };
+  const listedSchema = async (runtime: 'worker' | 'server'): Promise<ObservationsSchema> => {
+    let schema: ObservationsSchema | undefined;
+    await withServer(runtime, async client => {
+      schema = (await client.listTools()).tools.find(tool => tool.name === 'get_observations')?.inputSchema as ObservationsSchema;
+    });
+    return schema as ObservationsSchema;
+  };
+
+  it('states integer items in the worker runtime and has no top-level anyOf', async () => {
+    const schema = await listedSchema('worker');
+    expect(schema.properties.ids.items.type).toBe('integer');
+    expect(schema.anyOf).toBeUndefined();
+    expect(schema.oneOf).toBeUndefined();
+    expect(schema.allOf).toBeUndefined();
+  }, 30_000);
+
+  it('keeps string ids in the server runtime and has no top-level anyOf', async () => {
+    const schema = await listedSchema('server');
+    expect(schema.properties.ids.items.type).toEqual(['number', 'string']);
+    expect(schema.anyOf).toBeUndefined();
+    expect(schema.oneOf).toBeUndefined();
+    expect(schema.allOf).toBeUndefined();
+  }, 30_000);
+
+  it('coerces the string "123" to the integer 123 before calling the worker', async () => {
+    await withServer('worker', async (client, workerRequests) => {
+      const result = await client.callTool({ name: 'get_observations', arguments: { ids: ['123'] } });
+      expect(result.isError).toBeFalsy();
+      const batch = workerRequests.find(request => request.path === '/api/observations/batch');
+      expect(batch?.body.ids).toEqual([123]);
+    });
+  }, 30_000);
+
+  it('sends the integer 123 unchanged', async () => {
+    await withServer('worker', async (client, workerRequests) => {
+      const result = await client.callTool({ name: 'get_observations', arguments: { ids: [123] } });
+      expect(result.isError).toBeFalsy();
+      const batch = workerRequests.find(request => request.path === '/api/observations/batch');
+      expect(batch?.body.ids).toEqual([123]);
+    });
+  }, 30_000);
+
+  it('rejects "abc" with a clear message and makes no worker request', async () => {
+    await withServer('worker', async (client, workerRequests) => {
+      const result = await client.callTool({ name: 'get_observations', arguments: { ids: ['abc'] } });
+      expect(result.isError).toBe(true);
+      const text = (result.content as Array<{ text: string }>)[0].text;
+      expect(text).toContain('ids must be integers');
+      expect(text).toContain('"abc"');
+      expect(workerRequests.some(request => request.path === '/api/observations/batch')).toBe(false);
+    });
+  }, 30_000);
 });
 
 describe('work_state tools', () => {

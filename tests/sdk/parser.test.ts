@@ -556,6 +556,174 @@ describe('parseAgentXml — observation type against the mode enum', () => {
   });
 });
 
+// F10 / F10b: the live observer closes `<type>` with a stray tag and never writes
+// `</type>`, emits concept keywords such as `gotcha` as the type, and sometimes
+// omits the type. Recovered types must always be members of the active mode.
+describe('parseAgentXml — type recovery (F10, F10b)', () => {
+  function useMode(ids: string[]) {
+    const modeManager = ModeManager.getInstance() as unknown as { activeMode: unknown };
+    modeManager.activeMode = {
+      observation_types: ids.map(id => ({ id })),
+      observation_concepts: [],
+    };
+  }
+
+  const codeModeTypes = [
+    'bugfix', 'feature', 'refactor', 'change', 'discovery', 'decision',
+    'security_alert', 'security_note', 'sensitive',
+  ];
+
+  it('reads the type when a stray parameter tag closes it and no </type> exists', () => {
+    const xml = `<observation>
+  <type>discovery</parameter>
+  <title>Blob and Data Lake REST operations mapped to billing categories</title>
+</observation>`;
+
+    const result = expectObservation(xml);
+
+    expect(result[0].type).toBe('discovery');
+  });
+
+  it('reads the type when a stray reasoning_effort tag closes it and no </type> exists', () => {
+    const xml = `<observation>
+  <type>bugfix</reasoning_effort>
+  <title>Stray reasoning_effort closer</title>
+</observation>`;
+
+    const result = expectObservation(xml);
+
+    expect(result[0].type).toBe('bugfix');
+  });
+
+  it('reads an unclosed type that runs straight into the next tag', () => {
+    const xml = `<observation>
+  <type>refactor
+  <title>Type never closed</title>
+</observation>`;
+
+    const result = expectObservation(xml);
+
+    expect(result[0].type).toBe('refactor');
+  });
+
+  it('recovers the malformed type of a later observation in a multi-observation reply', () => {
+    const xml = `<observation>
+  <type>discovery</type>
+  <title>First, well formed</title>
+</observation>
+<observation>
+  <type>discovery</parameter>
+  <title>Second, stray closer</title>
+</observation>
+<observation>
+  <type>discovery</type>
+  <title>Third, well formed</title>
+</observation>`;
+
+    const result = expectObservation(xml);
+
+    expect(result.map(o => o.type)).toEqual(['discovery', 'discovery', 'discovery']);
+  });
+
+  it('does not treat a long unclosed run of prose as a type', () => {
+    const xml = `<observation>
+  <type>${'this is a whole sentence the model wrote into the type slot by mistake '.repeat(3)}
+  <title>Runaway type</title>
+</observation>`;
+
+    const result = expectObservation(xml);
+
+    expect(result[0].type).toBe('bugfix');
+  });
+
+  it('maps the concept keyword gotcha to discovery and keeps it as a concept', () => {
+    const xml = `<observation>
+  <type>gotcha</type>
+  <title>Rehearsal crons only fire after merge</title>
+  <concepts><concept>gotcha</concept><concept>trade-off</concept></concepts>
+</observation>`;
+
+    const result = expectObservation(xml);
+
+    expect(result[0].type).toBe('discovery');
+    expect(result[0].concepts).toEqual(['gotcha', 'trade-off']);
+  });
+
+  it('maps an undeclared finding label to discovery', () => {
+    const xml = `<observation>
+  <type>finding</type>
+  <title>Undeclared label</title>
+</observation>`;
+
+    expect(expectObservation(xml)[0].type).toBe('discovery');
+  });
+
+  it('maps milestone and what-changed to change when the mode declares change', () => {
+    useMode(codeModeTypes);
+    const milestone = `<observation><type>milestone</type><title>Phase closed</title></observation>`;
+    const whatChanged = `<observation><type>what-changed</type><title>Edited the ledger</title></observation>`;
+
+    expect(expectObservation(milestone)[0].type).toBe('change');
+    expect(expectObservation(whatChanged)[0].type).toBe('change');
+  });
+
+  it('keeps an undeclared label when the mapped type is not in the active mode', () => {
+    // The fixture mode (bugfix, discovery, refactor) has no `change`.
+    const xml = `<observation><type>milestone</type><title>Phase closed</title></observation>`;
+
+    expect(expectObservation(xml)[0].type).toBe('milestone');
+  });
+
+  it('normalizes the case of a declared type', () => {
+    const xml = `<observation><type> Discovery </type><title>Cased type</title></observation>`;
+
+    expect(expectObservation(xml)[0].type).toBe('discovery');
+  });
+
+  it('infers the type from the concepts when the type is absent', () => {
+    useMode(codeModeTypes);
+    const xml = `<observation>
+  <title>Concept-led observation</title>
+  <concepts><concept>how-it-works</concept><concept>what-changed</concept></concepts>
+</observation>`;
+
+    expect(expectObservation(xml)[0].type).toBe('change');
+  });
+
+  it('infers bugfix from problem-solution and decision from trade-off', () => {
+    useMode(codeModeTypes);
+    const problemSolution = `<observation><title>Concept led</title><concepts><concept>problem-solution</concept></concepts></observation>`;
+    const tradeOff = `<observation><title>Concept led</title><concepts><concept>trade-off</concept></concepts></observation>`;
+
+    expect(expectObservation(problemSolution)[0].type).toBe('bugfix');
+    expect(expectObservation(tradeOff)[0].type).toBe('decision');
+  });
+
+  it('infers the type from the title when the type and concepts are absent', () => {
+    useMode(codeModeTypes);
+    const xml = `<observation><title>Added a retry to the spool drain</title></observation>`;
+
+    expect(expectObservation(xml)[0].type).toBe('feature');
+  });
+
+  it('falls back to the first declared type when nothing indicates a type', () => {
+    useMode(codeModeTypes);
+    const xml = `<observation>
+  <title>Blob and Data Lake REST operations mapped to billing categories</title>
+  <facts><fact>Get Blob is a Read operation</fact></facts>
+</observation>`;
+
+    expect(expectObservation(xml)[0].type).toBe('bugfix');
+  });
+
+  it('never returns an inferred type the mode does not declare', () => {
+    // Fixture mode has no `decision`, so trade-off must not produce one.
+    const xml = `<observation><title>Concept led</title><concepts><concept>trade-off</concept></concepts></observation>`;
+
+    expect(expectObservation(xml)[0].type).toBe('bugfix');
+  });
+});
+
 // #4098: local models that emit capitalized XML wrapper tags (e.g. `<Concepts>`,
 // `<Files_read>`) silently lose facts/concepts/files because every tag regex in
 // the parser was built without the `i` flag. Each case below isolates exactly

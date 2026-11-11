@@ -40,6 +40,15 @@ export const DEFAULT_COOLDOWN_MS: Record<CooldownKind, number> = {
   auth_invalid: 6 * 60 * 60_000,  // 6 h (treat as likely-dead)
 };
 
+/**
+ * FORK P4: cooldown for a keychain or env sourced token that was refused in-band
+ * as an auth failure ("Failed to authenticate"). That refusal usually means the
+ * interactive client refreshed and rotated the login while the worker's child
+ * still held the old access token, so the stored login is not dead. 15 min
+ * instead of the 6 h auth_invalid default. Pool tokens keep the default.
+ */
+export const KEYCHAIN_AUTH_REFUSED_COOLDOWN_MS = 15 * 60_000;
+
 /** Derive a short, stable, non-reversible id from the raw token value. */
 function deriveId(token: string): string {
   return createHash('sha256').update(token).digest('hex').slice(0, 12);

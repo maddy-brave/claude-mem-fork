@@ -457,7 +457,12 @@ export async function startGeneratorWithProvider(
       // It is booked as the refused credential it is (auth_invalid), so the
       // SessionStart banner shows at once with the /login remedy rather than
       // waiting out the failure threshold and then offering a restart.
-      if (reason === 'auth:observer_text' && provider === 'claude' && !failureBooked) {
+      if (reason === 'auth:observer_text' && provider === 'claude' && !failureBooked && tryAuthRotation(session, provider)) {
+        // FORK P4: ResponseProcessor cooled the refused credential and a healthy
+        // pool token exists, so no failure is booked. The resume below restarts
+        // the generator, whose token read now lands on that pool token.
+        scheduledResume = { afterMs: 0, source: 'auth-rotate' };
+      } else if (reason === 'auth:observer_text' && provider === 'claude' && !failureBooked) {
         recordObserverFailure(provider, {
           message: 'Claude Code reported the observer as signed out',
           kind: 'auth_invalid',
@@ -627,6 +632,38 @@ function tryQuotaRotation(provider: SelectableProvider, sessionDbId: number, win
     sessionId: sessionDbId,
     provider,
     ...(window ? { window } : {}),
+    rotatedToId: plan.rotatedToId,
+  });
+  return true;
+}
+
+/**
+ * FORK P4: after an in-band auth refusal (`auth:observer_text`), true when the
+ * refused credential was cooled by ResponseProcessor and a healthy pool token
+ * exists, so the caller restarts on it instead of booking an auth outage. Only
+ * a primary run on the Claude Code login qualifies, the same test
+ * ResponseProcessor applies before it cools; an API-key run or a stand-in run
+ * keeps today's pause and booking. False also when the pool is empty, every
+ * token is cooling, or the restart guard in planPoolRotation trips, which
+ * bounds the restarts to the pool size per window.
+ */
+function tryAuthRotation(session: ActiveSession, provider: SelectableProvider): boolean {
+  if (provider !== 'claude' || session.observerAuth !== 'subscription') return false;
+  if (session.fallbackFrom != null || session.claudeAuthOverride != null) return false;
+  const plan = planPoolRotation();
+  if (!plan.rotate) {
+    if (plan.reason !== 'no_pool') {
+      logger.warn('SESSION', `Pausing for auth, no pool rotation: ${plan.reason}`, {
+        sessionId: session.sessionDbId,
+        provider,
+        ...(plan.recentRestarts !== undefined ? { recentRestarts: plan.recentRestarts, restartLimit: plan.restartLimit } : {}),
+      });
+    }
+    return false;
+  }
+  logger.warn('SESSION', `Auth refused on one credential; rotating to pool token ${plan.rotatedToId}`, {
+    sessionId: session.sessionDbId,
+    provider,
     rotatedToId: plan.rotatedToId,
   });
   return true;

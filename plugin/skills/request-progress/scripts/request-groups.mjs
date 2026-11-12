@@ -2538,7 +2538,7 @@ function parseTokenFile(filePath) {
   }
   return entries;
 }
-var DEFAULT_COOLDOWN_MS, OAuthTokenPool, oauthTokenPool;
+var DEFAULT_COOLDOWN_MS, KEYCHAIN_AUTH_REFUSED_COOLDOWN_MS, OAuthTokenPool, oauthTokenPool;
 var init_oauth_token_pool = __esm({
   "src/shared/oauth-token-pool.ts"() {
     "use strict";
@@ -2552,6 +2552,7 @@ var init_oauth_token_pool = __esm({
       auth_invalid: 6 * 60 * 6e4
       // 6 h (treat as likely-dead)
     };
+    KEYCHAIN_AUTH_REFUSED_COOLDOWN_MS = 15 * 6e4;
     OAuthTokenPool = class {
       _entries = [];
       _cooldowns = /* @__PURE__ */ new Map();
